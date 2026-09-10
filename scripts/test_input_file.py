@@ -7,7 +7,7 @@ import numpy as np
 
 sys.path.insert(0, ".")
 import config
-from models.vjepa_wrapper import VJEPAEncoder
+from models.world_model_wrapper import VJEPAEncoder
 from pipeline.clip_sampler import sample_clip_from_video
 
 path = Path(sys.argv[1] if len(sys.argv) > 1 else "test_input.mp4")

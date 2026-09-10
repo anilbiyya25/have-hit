@@ -159,7 +159,7 @@ STATE = {"encoder": None, "head": None, "analysis": None, "warm": False,
 
 
 def _load():
-    from models.vjepa_wrapper import VJEPAEncoder
+    from models.world_model_wrapper import VJEPAEncoder
 
     enc = VJEPAEncoder()
     for p in enc.model.parameters():

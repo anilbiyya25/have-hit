@@ -10,7 +10,7 @@ The V-JEPA encoder is frozen with requires_grad = False and never sees a
 gradient. Only the head is trained.
 
 Model provenance: V-JEPA 2.1 ViT-B/384 from Meta's own CDN via torch.hub
-(see models/vjepa_wrapper.py), not a third-party HuggingFace conversion.
+(see models/world_model_wrapper.py), not a third-party HuggingFace conversion.
 
 Usage:
     .\\run.ps1 train_classifier.py                    # extract + train
@@ -70,7 +70,7 @@ def extract_features(windows_per_video, existing=None):
     burn 80 minutes to reproduce vectors that are byte-for-byte identical,
     because the encoder is frozen and preprocessing is deterministic.
     """
-    from models.vjepa_wrapper import VJEPAEncoder
+    from models.world_model_wrapper import VJEPAEncoder
 
     classes = list(config.EXERCISES)
     dirs = discover_classes()

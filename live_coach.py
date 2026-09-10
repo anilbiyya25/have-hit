@@ -281,7 +281,7 @@ class Predictor:
     """Frozen encoder + trained head, running on its own thread."""
 
     def __init__(self, smooth=3, tta=True, enhance="auto"):
-        from models.vjepa_wrapper import VJEPAEncoder
+        from models.world_model_wrapper import VJEPAEncoder
 
         print("  loading encoder...")
         self.enc = VJEPAEncoder()
