@@ -13,7 +13,7 @@ import numpy as np
 
 sys.path.insert(0, ".")
 import config
-from models.world_model_wrapper import VJEPAEncoder
+from models.world_model import VJEPAEncoder
 
 H, W = 480, 640
 T = config.NUM_FRAMES

@@ -43,7 +43,7 @@ def main():
     print("\nloading (first run downloads ~1.2GB)...")
 
     t0 = time.time()
-    from models.world_model_wrapper import VJEPAEncoder
+    from models.world_model import VJEPAEncoder
     enc = VJEPAEncoder()
     load_s = time.time() - t0
 

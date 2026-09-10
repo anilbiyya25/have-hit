@@ -8,7 +8,7 @@ import torch
 
 sys.path.insert(0, ".")
 import config
-from models.world_model_wrapper import VJEPAEncoder
+from models.world_model import VJEPAEncoder
 
 print("loading encoder...")
 enc = VJEPAEncoder()

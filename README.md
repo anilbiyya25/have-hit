@@ -58,7 +58,7 @@ VJEPA_BASE_URL = "http://localhost:8300"                      <- committed dev o
 ```
 
 This breaks every pretrained `torch.hub` entrypoint in the repo with
-`ConnectionRefusedError`. `models/world_model_wrapper.py` restores the real URL at
+`ConnectionRefusedError`. `models/world_model.py` restores the real URL at
 runtime rather than editing the cached clone, so a re-clone can't silently
 reintroduce it. Weights still come from Meta's CDN.
 
@@ -112,7 +112,7 @@ self-consistency 1.000000, noise vs structured motion 0.72, distinct motions
 |---|---|
 | `run.ps1` | env vars + venv; use this, not bare `python` |
 | `config.py` | model, clip shape, preprocessing constants, exercise list |
-| `models/world_model_wrapper.py` | clip -> 768-dim embedding |
+| `models/world_model.py` | clip -> 768-dim embedding |
 | `models/classifier.py` | embedding -> exercise logits |
 | `pipeline/clip_sampler.py` | video file or live camera -> 16-frame clip |
 | `scripts/check_vjepa21.py` | 2.1 benchmark, head to head vs 2.0 |
