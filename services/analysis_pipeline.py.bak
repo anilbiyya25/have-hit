@@ -1,0 +1,1562 @@
+"""Unified asynchronous workout analysis: Stages A -> B -> C -> D.
+
+    A  V-JEPA 2.1      sample the file, embed every window, classify, find reps
+    B  latent dynamics trajectory consistency -> the 1-3 worst moments
+    C  SAM 2.1         segment those moments into candidate regions
+    D  Gemini          look at the video and those keyframes, write the report
+
+Stages A-C are local and produce MEASUREMENTS. Stage D is remote and produces
+JUDGEMENT. Keeping that line visible is the point of the split: every number the
+report leans on exists in the response independently of what Gemini said about
+it, so a claim can be checked rather than taken on trust.
+
+VRAM DISCIPLINE (4 GB RTX 3050)
+    Two vision backbones never sit in VRAM together. V-JEPA belongs to the
+    caller and stays loaded; SAM is pulled in for Stage C and released before
+    Stage D starts. `torch.cuda.empty_cache()` runs at every handoff. The whole
+    pipeline is serialised by the caller -- two concurrent uploads on this card
+    is an OOM, not a feature.
+"""
+
+import gc
+import json
+import time
+from pathlib import Path
+
+import numpy as np
+import torch
+
+import config
+import voice
+from pipeline.clip_sampler import sample_timeline
+from services import chapters
+from services import health
+from services import scene_cuts
+from services import clips, keyframes as kf
+from services import local_coach
+from services.latent_dynamics import LatentDynamicsEvaluator
+from services.rep_engine import REP_WINDOW_SECONDS, detect_reps, _mmss
+from services.segmentation import Segmenter
+
+# Finer than the old 2 s analysis windows: reps need several samples each to be
+# resolvable at all (see rep_engine's note on resolution). The ceiling bounds
+# GPU time on long footage by widening windows rather than adding more.
+WINDOW_SECONDS = REP_WINDOW_SECONDS
+MAX_WINDOWS = 96
+
+# Tried in order; the first that answers wins. Order is by NAMING QUALITY, not
+# just recency, because which model answers is the largest single source of
+# variation in the exercise names -- a chain that falls through is a chain that
+# renames the workout.
+#
+# gemini-3.5-flash is last on measured evidence: on the three-exercise
+# reference clip it named the BENCH PRESS chapter "Barbell Back Squat" in 3 of
+# the 4 runs where it answered, while the models above it named all three
+# chapters correctly every time they answered. Three of four, not three of
+# three -- it got the clip right once after this ordering was chosen, so the
+# demotion is a hedge against a model that is usually wrong here, not a verdict
+# that it always is.
+#
+# It is kept rather than removed because depth is what survives an outage --
+# one verification run had all four models return 503 and fall back to local
+# naming -- and a wrong name beats no report at all.
+GEMINI_MODELS = (
+    "gemini-flash-latest",
+    "gemini-3.7-flash",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash",
+)
+GEMINI_TIMEOUT_S = 300
+# Above this, the video goes via the Files API instead of inline.
+#
+# 18 MB was wrong and is a separate latent bug from the retry one above: inline
+# data is base64 in the request body, which inflates it by ~37%, and Gemini's
+# cap is 20 MB for the WHOLE request. 18 MB of video is 24.6 MB on the wire --
+# over the cap before the keyframes and prompt are added. Measured: a 13.15 MB
+# file is 17.54 MB base64, already close.
+#
+# 10 MB -> 13.7 MB on the wire, leaving real headroom for several keyframe
+# JPEGs and the prompt. Larger files take the Files API route, which costs an
+# upload round trip (~11 s measured for 13 MB) but has no such ceiling.
+INLINE_MAX_BYTES = 10 * 1024 * 1024
+UPLOAD_POLL_S = 2
+
+# Per-request wall clock for one generate_content call, in milliseconds.
+#
+# The SDK has NO default: a connection that opens and then stalls blocks the
+# calling thread forever. Observed exactly that -- a Stage D upgrade sat in
+# gemini_state "running" for over five minutes with no error, holding a
+# worker thread, while the model chain below it never got a turn because the
+# first model never returned. The report was fine (the local one had already
+# been delivered), so nothing surfaced the hang at all.
+#
+# 120 s is roughly twice the slowest successful call measured on this clip,
+# so a real answer is never cut off, and a hang now raises a timeout that
+# _is_retryable() treats as the server's fault and hands to the next model.
+GEMINI_REQUEST_TIMEOUT_MS = 120_000
+
+# How many times to walk the WHOLE model chain, and the wall clock past which
+# no new attempt is started.
+#
+# One pass was not enough, measured. On a flaky afternoon the same 13 MB clip
+# got 503 from one model, RemoteProtocolError from another and a clean answer
+# from a third -- and which model drew which changed between runs seconds
+# apart. A single pass therefore fails ENTIRELY on the unlucky ordering, which
+# is exactly what a user saw: "Server disconnected", four models tried, local
+# fallback, while the API was demonstrably answering.
+#
+# The deadline matters as much as the count: 3 passes x 4 models x a 120 s
+# request timeout is 24 minutes of a worker thread in the worst case, for a
+# report the user already has. 240 s stops new attempts long before that.
+STAGE_D_MAX_PASSES = 3
+STAGE_D_DEADLINE_S = 240
+STAGE_D_BACKOFF_S = (3, 9)
+
+SYSTEM_PROMPT = """You are a world-class sports kinesiologist and strength \
+coach. You analyse athletic movement in any discipline -- gym lifts, basketball, \
+tennis, golf, swimming, athletics, martial arts.
+
+You receive four kinds of evidence. They are not equally trustworthy, and using \
+them correctly is most of the job:
+
+1. THE VIDEO. Your primary and only source of TECHNIQUE. Joint angles, posture, \
+bar path, balance, sequencing -- all of it comes from watching.
+
+2. KEYFRAME IMAGES at the moments a local model flagged. These are the exact \
+frames the bounding boxes refer to, so use them to decide which box to cite.
+
+3. A LOCAL EXERCISE CLASSIFIER's reading. It knows only 27 gym movements and \
+nothing else, so on any other activity its label is meaningless and you must \
+ignore it. Even on gym footage it is roughly 44% accurate -- treat it as a weak \
+hint, never as the answer. You identify the activity yourself, from the video.
+
+4. LATENT TRAJECTORY MEASUREMENTS. A frozen V-JEPA 2.1 encoder embeds each time \
+window; a trajectory model then measures how far each window departs from the \
+movement's own recent trend. High "kinetic error" means the motion pattern \
+broke from what preceded it. This is real measurement, but it is UNITLESS and \
+relative to this clip only -- never convert it to m/s, degrees or newtons.
+
+   Critically: a kinetic-error spike says SOMETHING CHANGED, not that something \
+is WRONG. Camera cuts, the athlete re-racking, a title card, someone walking \
+past -- all spike it. It tells you where to look. The video tells you whether \
+there is a fault there. If you look and the movement is fine, say it is fine \
+and mark the phase optimal.
+
+RULES
+
+- Name phases in the vocabulary of the sport you actually see: a golf swing has \
+a takeaway, transition and release; a squat has a descent, sticking point and \
+lockout. Never "beginning / middle / end".
+- session_type is "gym_reps" for countable repetitions of a resistance or \
+bodyweight movement, "sports_drill" for continuous or open skill work.
+- total_reps: use the supplied rep count when its confidence is high or medium. \
+When it is low or none, count from the video yourself and prefer your own count.
+- visual_proof is ONE object describing the SINGLE worst moment, which has \
+already been located for you and is the timestamp of the keyframe image you \
+were given. Pick the SAM candidate box that encloses the joint or equipment at \
+fault and copy its normalized_bbox EXACTLY. Only if no candidate fits should you \
+supply your own [ymin, xmin, ymax, xmax] in 0-1 normalised coordinates.
+- target_object names what the box actually contains -- "left knee", "lumbar \
+spine", "barbell" -- not a whole-body label like "athlete".
+- If you look at that moment and the movement is genuinely sound, say so in \
+issue_description rather than inventing a fault to fill the field. A flagged \
+moment is where the motion CHANGED, and change is not proof of error.
+- Ground every observation in something visible. If the camera angle hides the \
+hips or the athlete leaves frame, say so instead of inventing detail. Confident \
+fabrication is the worst failure here, and quoting a kinetic-error number does \
+not make an invented fault real.
+- form_score is YOUR coaching judgement, 0-100. Nothing in the pipeline \
+measures it.
+- actionable_cue is exactly ONE directive the athlete applies on their next \
+repetition. "Drive your knees out over your little toes" -- not "work on form", \
+and not a list of drills.
+- If the footage shows no identifiable physical activity, set activity_detected \
+to "unclear", score low, and explain why."""
+
+# SAM runs per chapter, and each keyframe costs ~2.5 s plus a Gemini image.
+# Four covers a normal session's worth of distinct lifts; past that the report
+# stops being read and the request stops being fast.
+MAX_PROOF_CHAPTERS = 4
+
+# One Gemini call describes every chapter. N calls would multiply the slowest
+# stage by the number of exercises, and the model needs the whole session in
+# view anyway to tell a warm-up set from a working one.
+TIMELINE_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "session_summary": {"type": "STRING"},
+        "timeline": {
+            "type": "ARRAY",
+            "items": {
+                "type": "OBJECT",
+                "properties": {
+                    "chapter_index": {
+                        "type": "INTEGER",
+                        "description": "Index of the chapter this describes, "
+                                       "copied from the input. Do not invent "
+                                       "chapters.",
+                    },
+                    "exercise_name": {
+                        "type": "STRING",
+                        "description": "The exercise as YOU see it in this "
+                                       "chapter's frames, in plain English, "
+                                       "e.g. 'Barbell Back Squat'. Choose the "
+                                       "best match from that chapter's "
+                                       "`candidates` list, or an exact "
+                                       "biomechanical equivalent of one. Never "
+                                       "name a movement that is not being "
+                                       "performed in those frames.",
+                    },
+                    "form_score": {"type": "INTEGER"},
+                    "observation": {"type": "STRING"},
+                    # The three-part coaching card. Split into named fields
+                    # rather than left as one prose blob because they answer
+                    # three different questions -- what happened, what to
+                    # think on the next rep, what to train -- and a single
+                    # paragraph reliably collapsed into the first one.
+                    "mechanical_breakdown": {
+                        "type": "STRING",
+                        "description": "What went wrong MECHANICALLY at the "
+                                       "flagged instant, in 1-2 sentences. "
+                                       "Name the joint or segment from the "
+                                       "SAM target region, say which way it "
+                                       "moved and what that did to the "
+                                       "kinetic chain. Reference what is "
+                                       "visible in THAT keyframe. If the "
+                                       "movement is sound at that instant, "
+                                       "say so plainly.",
+                    },
+                    "actionable_cue": {
+                        "type": "STRING",
+                        "description": "Exactly ONE short mental cue for the "
+                                       "athlete's very next set. An "
+                                       "instruction they can hold in mind "
+                                       "mid-rep, not a paragraph.",
+                    },
+                    "corrective_drill": {
+                        "type": "STRING",
+                        "description": "ONE specific warm-up, mobility drill "
+                                       "or technique modification that "
+                                       "targets THIS fault, with a concrete "
+                                       "prescription (sets, reps or "
+                                       "duration). Not a general training "
+                                       "principle.",
+                    },
+                    "visual_proof": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "target_object": {"type": "STRING"},
+                            "normalized_bbox": {"type": "ARRAY",
+                                                "items": {"type": "NUMBER"}},
+                            "issue": {"type": "STRING"},
+                        },
+                        "required": ["target_object", "normalized_bbox",
+                                     "issue"],
+                    },
+                },
+                "required": ["chapter_index", "exercise_name", "form_score",
+                             "observation", "mechanical_breakdown",
+                             "actionable_cue", "corrective_drill"],
+            },
+        },
+    },
+    "required": ["timeline"],
+}
+
+RESPONSE_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "activity_detected": {"type": "STRING"},
+        "session_type": {"type": "STRING",
+                         "enum": ["gym_reps", "sports_drill"]},
+        "form_score": {"type": "INTEGER"},
+        "total_reps": {"type": "INTEGER"},
+        "best_rep": {
+            "type": "OBJECT",
+            "properties": {"rep_number": {"type": "INTEGER"},
+                           "timestamp": {"type": "STRING"}},
+            "required": ["rep_number", "timestamp"],
+        },
+        "worst_rep": {
+            "type": "OBJECT",
+            "properties": {"rep_number": {"type": "INTEGER"},
+                           "timestamp": {"type": "STRING"}},
+            "required": ["rep_number", "timestamp"],
+        },
+        "phases": {
+            "type": "ARRAY",
+            "items": {
+                "type": "OBJECT",
+                "properties": {
+                    "phase_name": {"type": "STRING"},
+                    "timestamp_start": {"type": "NUMBER"},
+                    "timestamp_end": {"type": "NUMBER"},
+                    "status": {"type": "STRING",
+                               "enum": ["optimal", "warning", "critical"]},
+                    "observation": {"type": "STRING"},
+                },
+                "required": ["phase_name", "timestamp_start", "timestamp_end",
+                             "status", "observation"],
+            },
+        },
+        # ONE object, not a list. The product promise is a single piece of
+        # visual proof at the single worst moment -- three boxes is a debug
+        # view, not evidence a user acts on.
+        "visual_proof": {
+            "type": "OBJECT",
+            "properties": {
+                "timestamp": {"type": "STRING"},
+                "target_object": {
+                    "type": "STRING",
+                    "description": "The joint or equipment the box encloses, "
+                                   "e.g. 'left knee', 'lumbar spine', "
+                                   "'barbell'.",
+                },
+                "normalized_bbox": {"type": "ARRAY",
+                                    "items": {"type": "NUMBER"},
+                                    "description": "[ymin, xmin, ymax, xmax], "
+                                                   "0-1."},
+                "issue_description": {"type": "STRING"},
+            },
+            "required": ["timestamp", "target_object", "normalized_bbox",
+                         "issue_description"],
+        },
+        # ONE directive. A list of drills is a training plan; this is the one
+        # thing to change on the next rep.
+        "actionable_cue": {"type": "STRING"},
+    },
+    "required": ["activity_detected", "session_type", "form_score",
+                 "total_reps", "phases", "visual_proof", "actionable_cue"],
+}
+
+
+def _release(stage=""):
+    """Collect garbage and hand freed VRAM back to the driver.
+
+    gc.collect() before empty_cache(), and that order is load-bearing: a
+    CUDA tensor still reachable from an uncollected cycle is still allocated,
+    so emptying the cache first frees only what Python already dropped. The
+    encoder's intermediate activations sit in exactly such cycles.
+
+    Called from finally: blocks, so it must never raise -- a failure to reclaim
+    memory must not replace the real exception that is on its way up.
+    """
+    try:
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:                                         # noqa: BLE001
+        pass
+
+
+def _vram_mb():
+    """Driver-visible VRAM in use, or None without CUDA. Never raises."""
+    try:
+        if not torch.cuda.is_available():
+            return None
+        free, total = torch.cuda.mem_get_info()
+        return round((total - free) / 1024 ** 2, 1)
+    except Exception:                                         # noqa: BLE001
+        return None
+
+
+# How many classes to keep per window. The top-1 label alone is a 44%-accurate
+# guess; the runner-up is frequently the right answer and costs nothing to
+# carry, since the softmax was computed in full either way. Stage D is given
+# the chapter-level aggregate of these as its candidate list.
+CLASSIFIER_TOPK = 3
+
+
+# Windows per GPU batch. Four, not sixteen, and the ceiling is host memory as
+# much as VRAM: the caller must hold every window's raw uint8 frames until the
+# batch flushes, and one 1080p window is 16 x 1920 x 1080 x 3 = 99 MB. At 4
+# that is a 400 MB peak; at 16 it is 1.6 GB, on a machine whose commit charge
+# is the thing that keeps breaking. See VJEPAEncoder.embed_many for the VRAM
+# and throughput measurements that pick the same number.
+STAGE_A_BATCH = 4
+
+
+def _classify(head, embs):
+    """(B, 768) embeddings -> [(label, conf, top_k)] per row."""
+    with torch.no_grad():
+        logits = head(torch.tensor(np.asarray(embs), device=config.DEVICE))
+        probs = torch.softmax(logits, dim=1).cpu().numpy()
+    out = []
+    for row in probs:
+        order = np.argsort(row)[::-1][:CLASSIFIER_TOPK]
+        top = [(config.ID_TO_LABEL[int(i)], round(float(row[int(i)]), 4))
+               for i in order]
+        out.append((top[0][0], top[0][1], top))
+    return out
+
+
+def _infer_batch(encoder, head, frames_list):
+    """N windows -> [(embedding, label, confidence, top_k)], one forward pass.
+
+    The embeddings are kept, not discarded: Stages A and B both need the
+    trajectory, and re-encoding to recover it would double GPU cost.
+    """
+    embs = encoder.embed_many(frames_list)
+    return [(embs[i], *cls)
+            for i, cls in enumerate(_classify(head, embs))]
+
+
+def _infer_window(encoder, head, frames):
+    """One window -> (embedding, label, confidence, top_k).
+
+    A batch of one over _infer_batch rather than a second implementation, so
+    the single-window and batched paths cannot drift on pooling or on how the
+    top-k is taken. Still used by the live chunk ingest path as a callable.
+    """
+    return _infer_batch(encoder, head, [frames])[0]
+
+
+def embed_timeline(path, encoder, head, window_seconds, max_windows,
+                   gpu_lock=None, cuts=None, batch=STAGE_A_BATCH):
+    """Decode a file and embed every window. -> (embeddings, times, timeline)
+
+    Windows accumulate to `batch` and flush together. The generator underneath
+    still yields one window at a time -- the point of that design was never to
+    embed one at a time, only to avoid holding the WHOLE file's frames at once
+    (60 windows of 720p is ~2.6 GB). A small batch keeps that property.
+
+    `cuts` is an optional scene_cuts.CutTracker; histograms are taken per
+    window in yield order, before batching, so a batch boundary cannot change
+    where a cut is reported.
+    """
+    embeddings, times, timeline = [], [], []
+    pend_frames, pend_times = [], []
+
+    def flush():
+        if not pend_frames:
+            return
+        if gpu_lock is not None:
+            with gpu_lock:
+                res = _infer_batch(encoder, head, pend_frames)
+        else:
+            res = _infer_batch(encoder, head, pend_frames)
+        for (t0, t1), (emb, label, conf, top) in zip(pend_times, res):
+            embeddings.append(emb)
+            times.append((t0, t1))
+            timeline.append({"t_start": round(t0, 2), "t_end": round(t1, 2),
+                             "exercise": label, "confidence": round(conf, 4),
+                             "top_k": [[l, p] for l, p in top]})
+        pend_frames.clear()
+        pend_times.clear()
+
+    for t0, t1, frames in sample_timeline(path, window_seconds=window_seconds,
+                                          max_windows=max_windows):
+        if cuts is not None:
+            cuts.add(frames)
+        pend_frames.append(frames)
+        pend_times.append((t0, t1))
+        if len(pend_frames) >= batch:
+            flush()
+    flush()
+    return embeddings, times, timeline
+
+
+# --------------------------------------------------------------------------
+# Stage A
+# --------------------------------------------------------------------------
+
+def stage_a(path, encoder, head, gpu_lock=None, window_seconds=WINDOW_SECONDS,
+            max_windows=MAX_WINDOWS):
+    """Sample the file and embed every window.
+
+    -> (embeddings, times, gym_timeline, cut_tracker)
+
+    Scene-cut detection rides along here rather than in a pass of its own: the
+    frames are decoded exactly once, and a histogram per frame is free next to
+    an encoder forward.
+    """
+    cuts = scene_cuts.CutTracker()
+    embeddings, times, timeline = [], [], []
+    try:
+        # top_k rides in each window as compact [label, prob] PAIRS, not
+        # objects: 3 entries per window over up to 96 windows all ship in the
+        # response, and the pair form is a third the bytes for the same
+        # information.
+        embeddings, times, timeline = embed_timeline(
+            path, encoder, head, window_seconds, max_windows,
+            gpu_lock=gpu_lock, cuts=cuts)
+    finally:
+        # A partial timeline still holds every activation the loop produced.
+        # Releasing only on success would leak the whole clip's worth of VRAM
+        # on the one path where memory is already the problem.
+        _release("stage_a")
+    return embeddings, times, timeline, cuts
+
+
+# --------------------------------------------------------------------------
+# Stage D
+# --------------------------------------------------------------------------
+
+# Failures worth trying the next model for. The rule is whose fault it is:
+# the server's problems are transient and another attempt may land, ours are
+# not and retrying just repeats them.
+#
+#   404 / NOT_FOUND  this model was withdrawn -- a sibling still exists.
+#                    (gemini-2.5-flash did exactly this: still listed by
+#                    models.list(), no longer callable by new keys.)
+#   5xx              server-side. 503 is per-MODEL capacity ("this model is
+#                    currently experiencing high demand"), so a sibling
+#                    frequently answers at once.
+#   transport        the connection dropped before a reply arrived. Observed
+#                    here as httpx RemoteProtocolError "Server disconnected
+#                    without sending a response" -- no API verdict was ever
+#                    reached, so nothing has been ruled out.
+#
+# 429 is deliberately absent: quota is billed account-wide, so walking the
+# list spends the rest of the budget collecting the same refusal four times.
+# 400/401/403 are absent for the same reason -- a malformed request or a bad
+# key is equally malformed against every model.
+_RETRYABLE_TEXT = ("404", "NOT_FOUND", "500", "502", "503", "504",
+                   "UNAVAILABLE", "INTERNAL", "DEADLINE_EXCEEDED",
+                   "Server disconnected", "Connection reset",
+                   "Remote end closed")
+_RETRYABLE_TYPES = ("RemoteProtocolError", "ConnectError", "ConnectTimeout",
+                    "ReadTimeout", "ReadError", "WriteError", "PoolTimeout",
+                    "ConnectionError", "TimeoutError", "ServerError")
+
+
+def _is_retryable(exc):
+    """True when the failure was the server's or the wire's, not the request's."""
+    name = exc.__class__.__name__
+    if name in _RETRYABLE_TYPES:
+        return True
+    msg = str(exc)
+
+    if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
+        # Quota is NOT always account-wide, which is what this code assumed
+        # until a real 429 said otherwise:
+        #
+        #   quotaId: GenerateRequestsPerDayPerProjectPerModel-FreeTier
+        #   quotaDimensions: {model: gemini-3.7-flash}
+        #
+        # A free-tier daily allowance is granted PER MODEL, so exhausting one
+        # model leaves its siblings untouched and moving on is both correct
+        # and free. A project-wide quota has no model dimension, and walking
+        # the list there really would spend the remainder on the same refusal
+        # four times over -- so only the per-model form is retried.
+        return "PerProjectPerModel" in msg or "quotaDimensions" in msg
+
+    return any(t in msg for t in _RETRYABLE_TEXT)
+
+
+def _file_state(f):
+    s = getattr(f, "state", None)
+    return str(getattr(s, "name", None) or getattr(s, "value", None) or s or "")
+
+
+def _video_part(client, types, path, mime_type, size_bytes):
+    """Video -> (Part, uploaded File or None). Small inline, large via Files."""
+    if size_bytes <= INLINE_MAX_BYTES:
+        return types.Part.from_bytes(data=Path(path).read_bytes(),
+                                     mime_type=mime_type), None
+    up = client.files.upload(file=str(path), config={"mime_type": mime_type})
+    deadline = time.time() + GEMINI_TIMEOUT_S
+    while _file_state(up) == "PROCESSING":
+        if time.time() > deadline:
+            raise TimeoutError("Gemini still processing the upload after "
+                               f"{GEMINI_TIMEOUT_S}s")
+        time.sleep(UPLOAD_POLL_S)
+        up = client.files.get(name=up.name)
+    if _file_state(up) == "FAILED":
+        raise RuntimeError("Gemini rejected the uploaded video")
+    return types.Part.from_uri(file_uri=up.uri,
+                               mime_type=up.mime_type or mime_type), up
+
+
+def _evidence_text(gym_read, gym_conf, dynamics, reps, segments, duration):
+    """The text half of the Stage D request."""
+    seg_lines = []
+    for s in segments:
+        cands = s.get("candidates") or []
+        if not cands:
+            seg_lines.append(f"  t={s['timestamp']}s : no candidate regions")
+            continue
+        seg_lines.append(f"  t={s['timestamp']}s :")
+        for c in cands:
+            seg_lines.append(
+                f"      candidate {c['candidate_id']}  "
+                f"bbox={c['normalized_bbox']}  "
+                f"area={c['area_fraction']}  sam_score={c['sam_score']}")
+
+    worst = dynamics.get("worst_moment")
+    worst_txt = (f"  t={worst['timestamp']}s  kinetic_error={worst['kinetic_error']}"
+                 f"  ({worst['severity']})"
+                 if worst else
+                 "  none -- the trajectory was clean and no moment stood out")
+    others = "\n".join(
+        f"    t={f['timestamp']}s  err={f['kinetic_error']} ({f['severity']})"
+        for f in dynamics["flagged_frames"] if f["rank"] != 1) or "    none"
+
+    return (
+        f"=== CLIP ===\n{duration}s of footage, "
+        f"{dynamics['windows']} windows of {WINDOW_SECONDS}s.\n\n"
+
+        "=== LOCAL EXERCISE CLASSIFIER (weak hint, 27 gym classes only) ===\n"
+        f"  dominant label : {gym_read}  (mean confidence {gym_conf})\n"
+        "  Ignore entirely if this is not one of 27 gym movements.\n\n"
+
+        "=== LATENT TRAJECTORY MEASUREMENTS (unitless, this clip only) ===\n"
+        f"  evaluator      : {dynamics['evaluator']}\n"
+        f"  kinetic error  : {dynamics['kinetic_error_score']}\n"
+        f"  mean / peak    : {dynamics['mean_kinetic_error']} / "
+        f"{dynamics['peak_kinetic_error']}\n"
+        f"  latent speed   : {dynamics['latent_speed']}\n\n"
+        "THE SINGLE WORST MOMENT of kinetic breakdown -- this is the keyframe\n"
+        "image you were given, and the one visual_proof must describe:\n"
+        f"{worst_txt}\n"
+        "  Secondary moments, for context only, NOT to be reported:\n"
+        f"{others}\n\n"
+
+        "=== REPETITION STRUCTURE ===\n"
+        f"  detected reps  : {reps['total_reps']}\n"
+        f"  confidence     : {reps['confidence']}\n"
+        f"  cadence        : {reps['cadence_per_min']}/min\n"
+        f"  period         : {reps.get('period_seconds')}s "
+        f"({reps.get('windows_per_rep')} windows per rep)\n"
+        f"  note           : {reps.get('note') or 'none'}\n"
+        f"  boundaries     : {json.dumps(reps['reps'][:20])}\n\n"
+
+        "=== SAM 2.1 CANDIDATE REGIONS ON FLAGGED KEYFRAMES ===\n"
+        "SAM has no vocabulary and was pointed at a grid, so these are objects\n"
+        "it found, NOT identified parts. Match them to what you see in the\n"
+        "keyframe images and copy the bbox of whichever contains the fault.\n"
+        f"{chr(10).join(seg_lines) or '  none'}\n\n"
+
+        "=== TASK ===\n"
+        "Watch the video. Identify the activity. Break the movement into its\n"
+        "real phases, named in that sport's vocabulary. Investigate each\n"
+        "flagged moment against the video and report only genuine faults."
+    )
+
+
+def stage_d(path, mime_type, size_bytes, gym_read, gym_conf, dynamics, reps,
+            segments, keyframe_images, duration):
+    """Send video + keyframes + measurements to Gemini. Returns (dict, source)."""
+    if not voice.available():
+        return None, "unavailable: set GEMINI_API_KEY to enable analysis"
+    client = voice.client()
+    if client is None:
+        return None, "unavailable: Gemini client could not be created"
+
+    from google.genai import types
+
+    uploaded = None
+    used = None
+    try:
+        part, uploaded = _video_part(client, types, path, mime_type, size_bytes)
+        contents = [part]
+        # Keyframes go in labelled, so the model can tie a box to a frame.
+        for t, jpg in keyframe_images:
+            contents.append(types.Part.from_text(
+                text=f"[keyframe at t={t}s -- boxes below are in this frame]"))
+            contents.append(types.Part.from_bytes(data=jpg,
+                                                  mime_type="image/jpeg"))
+        contents.append(types.Part.from_text(
+            text=_evidence_text(gym_read, gym_conf, dynamics, reps, segments,
+                                duration)))
+
+        cfg = types.GenerateContentConfig(
+            system_instruction=SYSTEM_PROMPT,
+            response_mime_type="application/json",
+            response_schema=RESPONSE_SCHEMA,
+            temperature=DECODE_TEMPERATURE,
+            http_options=types.HttpOptions(
+                timeout=GEMINI_REQUEST_TIMEOUT_MS),
+        )
+
+        text, last, used = None, None, None
+        deadline = time.time() + STAGE_D_DEADLINE_S
+        for attempt in range(STAGE_D_MAX_PASSES):
+            if attempt:
+                # Backoff before re-walking the chain. 503 is "this model is
+                # busy right now" and a disconnect is a dropped connection --
+                # both are states that a few seconds routinely clears, and
+                # hammering immediately just collects the same refusal faster.
+                wait = STAGE_D_BACKOFF_S[min(attempt - 1,
+                                             len(STAGE_D_BACKOFF_S) - 1)]
+                if time.time() + wait >= deadline:
+                    break
+                time.sleep(wait)
+            fatal = False
+            for model in GEMINI_MODELS:
+                if time.time() >= deadline:
+                    break
+                try:
+                    resp = client.models.generate_content(
+                        model=model, contents=contents, config=cfg)
+                except Exception as exc:                      # noqa: BLE001
+                    last = exc
+                    if not _is_retryable(exc):
+                        # A bad key or a malformed request is equally bad
+                        # against every model and on every pass. Stop.
+                        fatal = True
+                        break
+                    continue
+                body = (resp.text or "").strip()
+                if not body:
+                    # A 200 with no completion in it. Seen from thinking
+                    # models that spend the whole output budget before writing
+                    # an answer. Not a verdict on the request, so the next
+                    # model gets a turn.
+                    last = RuntimeError(f"{model} returned an empty response")
+                    continue
+                used, text = model, body
+                break
+            if text is not None or fatal:
+                break
+        if text is None:
+            return None, (f"gemini failed after {STAGE_D_MAX_PASSES} passes: "
+                          f"{last.__class__.__name__}: {last}")
+        return json.loads(text), used
+    except json.JSONDecodeError as exc:
+        return None, f"{used} returned unparseable JSON: {exc}"
+    except Exception as exc:                                  # noqa: BLE001
+        return None, f"gemini failed: {exc.__class__.__name__}: {exc}"
+    finally:
+        if uploaded is not None:
+            # Files API keeps uploads ~48h. This was for one request.
+            try:
+                client.files.delete(name=uploaded.name)
+            except Exception:                                 # noqa: BLE001
+                pass
+
+
+# --------------------------------------------------------------------------
+# Chapter analysis
+# --------------------------------------------------------------------------
+
+def analyse_chapters(chapters, embeddings, times, excluded_windows=None):
+    """Run Stage B and rep detection INSIDE each exercise chapter.
+
+    Running them once over the whole file is what makes a long session
+    useless: reps from a squat set and a bench set land in one autocorrelation
+    that finds neither period, and one kinetic-error series normalises a
+    deadlift's spikes against a plank's stillness. Per chapter, both measure
+    something real.
+    """
+    ev = LatentDynamicsEvaluator()
+    out = []
+    for i, ch in enumerate(chapters):
+        if ch["kind"] != "exercise":
+            out.append({**ch, "chapter_index": i, "dynamics": None,
+                        "reps": None})
+            continue
+        s, e = ch["start"], ch["end"]
+        sub_emb, sub_times = embeddings[s:e], times[s:e]
+        if len(sub_emb) < 2:
+            out.append({**ch, "chapter_index": i, "dynamics": None,
+                        "reps": None})
+            continue
+        # Rebase the exclusion set into chapter-local indices. Passing global
+        # ones would mask the wrong windows in every chapter after the first.
+        local_excl = {g - s for g in (excluded_windows or ()) if s <= g < e}
+        dyn = ev.evaluate(sub_emb, sub_times, local_excl)
+        reps = detect_reps(sub_emb, sub_times, dyn["kinetic_error_score"])
+        out.append({**ch, "chapter_index": i, "dynamics": dyn, "reps": reps})
+    return out
+
+
+# Frames sampled per chapter purely so Gemini can SEE that chapter. Three
+# spread across the block is enough to name a lift; more is upload weight.
+CONTEXT_FRAMES_PER_CHAPTER = 3
+
+
+def chapter_sample_times(chapter):
+    """Timestamps that represent a chapter: its worst moment plus two spreads.
+
+    The worst moment is included because it is the frame the coaching will
+    reference. The other two are taken at a third and two thirds through, so
+    a chapter is described by its middle rather than by its edges -- the edges
+    are where transitions and re-racking live.
+    """
+    t0, t1 = chapter["t_start"], chapter["t_end"]
+    span = max(t1 - t0, 0.1)
+    picks = [t0 + span / 3.0, t0 + 2.0 * span / 3.0]
+    wm = (chapter.get("dynamics") or {}).get("worst_moment")
+    if wm:
+        picks.append(wm["timestamp"])
+    # Dedupe near-identical stamps: a short chapter can put all three within a
+    # frame of each other, and uploading the same JPEG three times is waste.
+    out = []
+    for t in sorted(picks):
+        if all(abs(t - u) > 0.4 for u in out):
+            out.append(round(min(max(t, t0), max(t1 - 0.05, t0)), 2))
+    return out[:CONTEXT_FRAMES_PER_CHAPTER]
+
+
+def _proof_chapters(analysed):
+    """Which chapters get a SAM keyframe: the worst-behaving ones, capped.
+
+    Ranked by peak kinetic error so the budget goes to the chapters most
+    likely to contain something worth showing, rather than simply the first
+    few in the session.
+    """
+    scored = [c for c in analysed
+              if c["kind"] == "exercise" and c.get("dynamics")
+              and c["dynamics"].get("worst_moment")]
+    scored.sort(key=lambda c: c["dynamics"]["peak_kinetic_error"], reverse=True)
+    return scored[:MAX_PROOF_CHAPTERS]
+
+
+# --------------------------------------------------------------------------
+# Naming: constraining Stage D, and reconciling it afterwards
+# --------------------------------------------------------------------------
+
+# Greedy decoding. The observed failure was a chapter that is unambiguously a
+# squat coming back as "Romanian Deadlift" on one run and "Barbell Back Squat"
+# on three others, from identical inputs -- sampling noise, not a difference of
+# opinion. There is nothing here that benefits from variety: the field is a
+# label for a movement that either is or is not what it is, and a user who
+# re-opens a session expects the same word to be there.
+DECODE_TEMPERATURE = 0.0
+
+# Above this mean probability mass, the local head's reading is taken to beat a
+# contradicting one from Gemini. Below it the video wins, because looking at
+# the movement is a better way to name it than a weak classifier is.
+#
+# MEASURED, AND IT MATTERS: on the three-exercise reference clip the highest
+# chapter-level mass this head produced anywhere was 0.501, on the one chapter
+# it read correctly and consistently (bench press, 84.2% self-agreement). The
+# other two sat at 0.174 and 0.222. So at 0.85 this guard is DORMANT on real
+# footage -- it fires only in the synthetic case, and the run where
+# gemini-3.5-flash called the bench press a "Barbell Back Squat" was not
+# caught by it.
+#
+# The threshold is left where it was specified rather than tuned down to that
+# one example: lowering it is a decision to let a 44%-accurate classifier
+# overrule the model that actually watched the video, and one chapter is not a
+# calibration set. What the code does instead is RECORD every contradiction,
+# above the gate or below it, so the evidence for choosing a number exists
+# before the number is chosen.
+VJEPA_OVERRIDE_CONFIDENCE = 0.85
+
+# Words that appear across too many class names to distinguish one from
+# another. Matching on these would score "Barbell Bench Press" as agreement
+# with `barbell_row`, which is exactly the mistake this check exists to catch.
+_GENERIC_TOKENS = {
+    "barbell", "dumbbell", "machine", "cable", "kettlebell", "bodyweight",
+    "weighted", "seated", "standing", "kneeling", "lying", "with", "and",
+    "the", "a", "an", "of", "on", "in", "to", "single", "double", "one",
+    "two", "alternating", "reverse", "incline", "decline", "close", "wide",
+    "narrow", "grip", "arm", "leg", "hand", "assisted", "smith", "olympic",
+    "exercise", "movement", "variation", "style", "unclear", "up", "down",
+    # `ups` survives singularisation (too short to strip) and is shared by
+    # push_ups, pull_ups and sit_ups, so on its own it distinguishes nothing.
+    "ups", "downs",
+}
+
+
+def _tokens(name):
+    """A name -> its distinguishing word set, singularised and lowercased.
+
+    Singularising matters more than it looks: the class list holds `squats`,
+    `lunges` and `push_ups` while a coach writes "Barbell Back Squat" and
+    "Walking Lunge", and a set intersection on the raw strings would call every
+    one of those a contradiction.
+    """
+    out = set()
+    for raw in str(name or "").replace("_", " ").replace("-", " ").split():
+        w = "".join(ch for ch in raw.lower() if ch.isalpha())
+        if len(w) > 3 and w.endswith("es") and not w.endswith("ses"):
+            w = w[:-2] if w[:-2].endswith(("ch", "sh", "x", "z")) else w[:-1]
+        elif len(w) > 3 and w.endswith("s") and not w.endswith("ss"):
+            w = w[:-1]
+        if w and w not in _GENERIC_TOKENS:
+            out.add(w)
+    return out
+
+
+def names_agree(vjepa_label, gemini_name):
+    """True when the two names could plausibly describe the same movement.
+
+    Deliberately PERMISSIVE, and the asymmetry is the whole design. A false
+    agreement costs nothing -- Gemini's name stands, which is the default. A
+    false contradiction overwrites a correct name that came from watching the
+    video with a wrong one from a classifier, which is a worse report than the
+    bug this guard was added for. So any shared distinguishing word is enough:
+    `deadlift` matches "Romanian Deadlift", `bicep_curl` matches "Seated
+    Barbell Bicep Curl", and `barbell_squat` matches neither, which is the
+    case that actually needed catching.
+    """
+    a, b = _tokens(vjepa_label), _tokens(gemini_name)
+    if not a or not b:
+        return True          # nothing to compare is not evidence of conflict
+    return bool(a & b)
+
+
+def canonical_name(label):
+    """A class id -> the name shown to a user. `barbell_squat` -> Barbell Squat."""
+    return str(label or "unclear").replace("_", " ").title()
+
+
+def reconcile_name(chapter, gemini_name):
+    """Settle on one exercise name. -> (name, source, discrepancy or None).
+
+    Order of authority:
+      1. Gemini, which is the only thing here that actually watched the video;
+      2. except where the local head was overwhelmingly confident AND Gemini
+         named something with no word in common with it, which is the
+         hallucination signature this exists to catch;
+      3. the local label, when Gemini said nothing at all.
+    """
+    cands = chapter.get("vjepa_candidates") or []
+    top = cands[0] if cands else None
+
+    if not gemini_name:
+        # The plurality label, not the mass-ranked candidate: it is what
+        # local_coach already derives its cue from, and a report whose name and
+        # coaching came from two different readings is worse than either.
+        return canonical_name(chapter.get("label")
+                              or (top or {}).get("exercise")), "local", None
+
+    if top and not names_agree(top["exercise"], gemini_name):
+        # Recorded whether or not it is acted on. A disagreement that loses to
+        # the threshold is still the only evidence that exists for where the
+        # threshold belongs, and the alternative -- discarding it silently --
+        # is how a naming bug survives four verification runs unnoticed.
+        override = top.get("confidence", 0.0) >= VJEPA_OVERRIDE_CONFIDENCE
+        note = {
+            "chapter_index": chapter.get("chapter_index"),
+            "gemini_name": gemini_name,
+            "vjepa_name": canonical_name(top["exercise"]),
+            "vjepa_confidence": top.get("confidence", 0.0),
+            "threshold": VJEPA_OVERRIDE_CONFIDENCE,
+            "resolution": ("overrode gemini with the local classifier"
+                           if override else
+                           "kept gemini; classifier below the override "
+                           "threshold"),
+        }
+        if override:
+            return canonical_name(top["exercise"]), "vjepa-override", note
+        return gemini_name, "gemini", note
+
+    return gemini_name, "gemini", None
+
+
+def _candidate_block(chapter):
+    """The candidate shortlist for one chapter, as prompt text."""
+    cands = chapter.get("vjepa_candidates") or []
+    if not cands:
+        return "      candidates   : none (classifier gave no usable reading)"
+    return ("      candidates   : "
+            + ", ".join(f"{c['exercise']} ({c['confidence']})" for c in cands))
+
+
+def _timeline_prompt(analysed, duration):
+    """Describe every chapter to Gemini, with the keyframes it can see."""
+    lines = []
+    for c in analysed:
+        if c["kind"] == "rest":
+            lines.append(
+                f"  chapter {c['chapter_index']}: REST  "
+                f"{c['t_start']}-{c['t_end']}s ({c['duration_s']}s) -- the "
+                "athlete was largely still. Do not report it as an exercise.")
+            continue
+        d, r = c.get("dynamics") or {}, c.get("reps") or {}
+        wm = (d.get("worst_moment") or {}) if d else {}
+        lines.append(
+            f"  chapter {c['chapter_index']}: {c['t_start']}-{c['t_end']}s "
+            f"({c['duration_s']}s)\n"
+            f"      local label   : {c['label']} "
+            f"(agreement {c['label_agreement']}, conf {c['mean_confidence']})\n"
+            + _candidate_block(c) + "\n"
+            f"      measured reps : {r.get('total_reps', 0)} "
+            f"({r.get('confidence', 'n/a')} confidence, "
+            f"cadence {r.get('cadence_per_min', 0)}/min)\n"
+            f"      kinetic peak  : {d.get('peak_kinetic_error')} "
+            f"(mean {d.get('mean_kinetic_error')})\n"
+            f"      worst moment  : "
+            + (f"{wm.get('timestamp')}s, severity {wm.get('severity')}"
+               if wm else "none -- trajectory stayed consistent"))
+    return (
+        f"=== SESSION: {duration}s, {len(analysed)} chapters ===\n\n"
+        "Chapters were found locally by clustering V-JEPA embeddings and\n"
+        "smoothing the classifier's per-window labels. The time ranges are\n"
+        "MEASURED and you must keep them.\n\n"
+        "`candidates` is the V-JEPA classifier's top-3 for that chapter with\n"
+        "its mean probability, strongest first. It is a shortlist, not an\n"
+        "answer -- the head knows only 27 gym movements and is roughly 44%\n"
+        "accurate, so the right movement is often second or third in the list\n"
+        "and occasionally not in it at all.\n\n"
+        + "\n".join(lines) + "\n\n"
+        "=== TASK ===\n"
+        "Return one timeline entry per EXERCISE chapter, using the same\n"
+        "chapter_index. Skip rest chapters entirely.\n\n"
+        "NAMING. You must choose the `exercise_name` that best matches the\n"
+        "visual action from that chapter's candidates list, or its exact\n"
+        "biomechanical equivalent -- a more specific or better-phrased name\n"
+        "for the SAME movement is welcome ('Barbell Back Squat' for\n"
+        "`barbell_squat`), a DIFFERENT movement is not. Do NOT name a\n"
+        "movement that is not being performed in that chapter's frames.\n"
+        "Only when the frames plainly show something no candidate describes\n"
+        "-- a non-gym activity, or a lift outside the 27 the head knows --\n"
+        "should you name it freely, and then name what you can see rather\n"
+        "than what would sound plausible.\n\n"
+        "PROOF. For chapters where a keyframe image was supplied, fill\n"
+        "visual_proof by choosing the SAM candidate box that contains the\n"
+        "fault and copying its bbox verbatim; if the movement at that moment\n"
+        "is sound, say so in `issue` rather than inventing a fault.\n\n"
+        "COACHING CARD. Three fields, three different jobs. Write each\n"
+        "for THIS athlete at THIS instant -- a sentence that would read\n"
+        "the same for any lifter doing any squat is a failure, however\n"
+        "true it is.\n"
+        "  - mechanical_breakdown: what the body actually did at the\n"
+        "    flagged moment. Name the segment inside the SAM box, the\n"
+        "    direction it went, and the consequence up or down the\n"
+        "    kinetic chain. Tie it to the numbers you were given -- the\n"
+        "    kinetic peak, the cadence, which rep was worst -- and to\n"
+        "    what the keyframe actually shows.\n"
+        "  - actionable_cue: one short sentence the athlete repeats to\n"
+        "    themselves mid-rep. If the breakdown is at the knee, the\n"
+        "    cue is about the knee.\n"
+        "  - corrective_drill: one named drill or setup change that\n"
+        "    trains the specific failure just described, with a real\n"
+        "    prescription -- 2x12 banded lateral walks before your\n"
+        "    working sets, not work on hip mobility.\n"
+        "If the moment is genuinely sound, say that in\n"
+        "mechanical_breakdown, make the cue one that maintains what is\n"
+        "already working, and offer a drill that builds on it. Do NOT\n"
+        "invent a fault to fill the card -- a confident correction for a\n"
+        "problem the athlete does not have is the most damaging thing\n"
+        "this system can output.")
+
+
+def stage_d_timeline(path, mime_type, size_bytes, analysed, proof_frames,
+                     duration, context_frames=None):
+    """One multimodal call describing every chapter. -> (dict|None, source).
+
+    `path` may be None. The chunked session path has no single file covering
+    the session -- each chunk is its own recording -- so there the CONTEXT
+    FRAMES are the whole of the visual evidence.
+
+    `context_frames` is [(chapter_index, t, jpg)] and exists because sending
+    footage from one chapter only was measurably wrong: asked to name three
+    lifts while shown one, the model named the two it could not see
+    incorrectly. Every chapter now arrives with its own frames, labelled.
+    """
+    if not voice.available():
+        return None, "unavailable: set GEMINI_API_KEY to enable analysis"
+    client = voice.client()
+    if client is None:
+        return None, "unavailable: Gemini client could not be created"
+
+    from google.genai import types
+
+    uploaded = None
+    used = None
+    try:
+        contents = []
+        if path:
+            part, uploaded = _video_part(client, types, path, mime_type,
+                                         size_bytes)
+            contents.append(part)
+
+        # Context first, grouped per chapter, so the model builds a picture of
+        # each block before it is told which moment was flagged inside it.
+        by_chapter = {}
+        for ch_idx, t, jpg in (context_frames or []):
+            by_chapter.setdefault(ch_idx, []).append((t, jpg))
+        for ch_idx in sorted(by_chapter):
+            frames = by_chapter[ch_idx]
+            contents.append(types.Part.from_text(
+                text=f"[CHAPTER {ch_idx} -- {len(frames)} frames sampled "
+                     f"across this block at "
+                     f"{', '.join(f'{t}s' for t, _ in frames)}. Name THIS "
+                     f"chapter's exercise from these frames.]"))
+            for _, jpg in frames:
+                contents.append(types.Part.from_bytes(data=jpg,
+                                                      mime_type="image/jpeg"))
+
+        for ch_idx, t, jpg, cands in proof_frames:
+            box_txt = "\n".join(
+                f"        candidate {c['candidate_id']} "
+                f"bbox={c['normalized_bbox']} area={c['area_fraction']} "
+                f"score={c['sam_score']}" for c in cands) or "        none"
+            contents.append(types.Part.from_text(
+                text=f"[keyframe for chapter {ch_idx} at t={t}s -- SAM "
+                     f"candidate regions in THIS frame:\n{box_txt}]"))
+            contents.append(types.Part.from_bytes(data=jpg,
+                                                  mime_type="image/jpeg"))
+        contents.append(types.Part.from_text(
+            text=_timeline_prompt(analysed, duration)))
+
+        cfg = types.GenerateContentConfig(
+            system_instruction=SYSTEM_PROMPT,
+            response_mime_type="application/json",
+            response_schema=TIMELINE_SCHEMA,
+            temperature=DECODE_TEMPERATURE,
+            http_options=types.HttpOptions(
+                timeout=GEMINI_REQUEST_TIMEOUT_MS),
+        )
+        text, last, used = None, None, None
+        deadline = time.time() + STAGE_D_DEADLINE_S
+        for attempt in range(STAGE_D_MAX_PASSES):
+            if attempt:
+                # Backoff before re-walking the chain. 503 is "this model is
+                # busy right now" and a disconnect is a dropped connection --
+                # both are states that a few seconds routinely clears, and
+                # hammering immediately just collects the same refusal faster.
+                wait = STAGE_D_BACKOFF_S[min(attempt - 1,
+                                             len(STAGE_D_BACKOFF_S) - 1)]
+                if time.time() + wait >= deadline:
+                    break
+                time.sleep(wait)
+            fatal = False
+            for model in GEMINI_MODELS:
+                if time.time() >= deadline:
+                    break
+                try:
+                    resp = client.models.generate_content(
+                        model=model, contents=contents, config=cfg)
+                except Exception as exc:                      # noqa: BLE001
+                    last = exc
+                    if not _is_retryable(exc):
+                        # A bad key or a malformed request is equally bad
+                        # against every model and on every pass. Stop.
+                        fatal = True
+                        break
+                    continue
+                body = (resp.text or "").strip()
+                if not body:
+                    # A 200 with no completion in it. Seen from thinking
+                    # models that spend the whole output budget before writing
+                    # an answer. Not a verdict on the request, so the next
+                    # model gets a turn.
+                    last = RuntimeError(f"{model} returned an empty response")
+                    continue
+                used, text = model, body
+                break
+            if text is not None or fatal:
+                break
+        if text is None:
+            return None, (f"gemini failed after {STAGE_D_MAX_PASSES} passes: "
+                          f"{last.__class__.__name__}: {last}")
+        return json.loads(text), used
+    except json.JSONDecodeError as exc:
+        return None, f"{used} returned unparseable JSON: {exc}"
+    except Exception as exc:                                  # noqa: BLE001
+        return None, f"gemini failed: {exc.__class__.__name__}: {exc}"
+    finally:
+        if uploaded is not None:
+            try:
+                client.files.delete(name=uploaded.name)
+            except Exception:                                 # noqa: BLE001
+                pass
+
+
+# --------------------------------------------------------------------------
+# Orchestrator
+# --------------------------------------------------------------------------
+
+
+def run_analysis(path, encoder, head, mime_type="video/mp4", size_bytes=None,
+                 gpu_lock=None, enable_sam=True, enable_gemini=True,
+                 precomputed=None, session_id=None):
+    """Full A -> chapters -> B -> C -> D. Blocking; call it in a worker thread.
+
+    `precomputed` lets the chunk pipeline hand over embeddings it already
+    extracted while the user was still recording, skipping Stage A entirely.
+    Shape: {"embeddings": [...], "times": [...], "gym_timeline": [...]}.
+
+    MEMORY DISCIPLINE
+        Each stage runs inside try/finally so gc.collect() + empty_cache()
+        happen on the failure path too. That matters more than on the success
+        path: the runs that die are the ones that died of memory pressure, and
+        an un-reclaimed backbone would take the NEXT request down as well,
+        turning one bad clip into a server that never recovers.
+    """
+    t0 = time.perf_counter()
+    path = str(path)
+    size_bytes = size_bytes if size_bytes is not None else Path(path).stat().st_size
+    vram_start = _vram_mb()
+
+    try:
+        # --- Stage A -------------------------------------------------------
+        try:
+            if precomputed:
+                embeddings = precomputed["embeddings"]
+                times = precomputed["times"]
+                gym_timeline = precomputed["gym_timeline"]
+                excluded = set(precomputed.get("excluded_windows") or ())
+                cut_info = precomputed.get("cut_summary") or {}
+            else:
+                embeddings, times, gym_timeline, cuts = stage_a(
+                    path, encoder, head, gpu_lock)
+                excluded = cuts.excluded_windows()
+                cut_info = cuts.summary()
+        finally:
+            _release("stage_a")
+        if not embeddings:
+            raise ValueError("could not decode the upload as video")
+        t_a = time.perf_counter()
+        vram_a = _vram_mb()
+
+        counts = {}
+        for w in gym_timeline:
+            counts[w["exercise"]] = counts.get(w["exercise"], 0) + 1
+        gym_read = max(counts, key=counts.get)
+        gym_conf = round(float(np.mean([w["confidence"] for w in gym_timeline
+                                        if w["exercise"] == gym_read])), 4)
+        duration = round(float(times[-1][1]), 2)
+
+        # --- Stage B + chaptering ------------------------------------------
+        try:
+            # Whole-clip dynamics first: chapter detection needs the latent
+            # speed series to find rest, and the response still reports a
+            # session-wide view alongside the per-chapter ones.
+            dynamics = LatentDynamicsEvaluator().evaluate(embeddings, times,
+                                                          excluded)
+            reps = detect_reps(embeddings, times,
+                               dynamics["kinetic_error_score"])
+            chapter_spans = chapters.detect_chapters(
+                embeddings, times, gym_timeline, dynamics["latent_speed"])
+            analysed = analyse_chapters(chapter_spans, embeddings, times,
+                                        excluded)
+        finally:
+            _release("stage_b")
+        t_b = time.perf_counter()
+
+        # --- Stage C -------------------------------------------------------
+        # One keyframe per chapter worth proving, not one per clip. SAM loads
+        # once for all of them: the image encoder is the cost, and paying it
+        # per chapter would multiply the stage by the exercise count.
+        segments, sam_error = [], None
+        proof_frames = []
+        # Kept apart from proof_frames on purpose -- see the note in
+        # chunk_pipeline: proof_frames is the "here is a fault, boxes below"
+        # payload sent to Gemini, and a clean rep does not belong in it.
+        best_frames = []
+        context_frames = []
+        try:
+            # Context frames for EVERY chapter, so Gemini can name each block
+            # from its own footage rather than inferring it from a neighbour.
+            ctx_stamps = [(c["chapter_index"], t)
+                          for c in analysed if c["kind"] == "exercise"
+                          for t in chapter_sample_times(c)]
+            if ctx_stamps:
+                for (ch_idx, t), (_, frame) in zip(
+                        ctx_stamps, kf.grab(path, [t for _, t in ctx_stamps])):
+                    jpg = kf.to_jpeg(frame)
+                    if jpg:
+                        context_frames.append((ch_idx, round(t, 2), jpg))
+
+            wanted = _proof_chapters(analysed)
+            stamps = [(c["chapter_index"],
+                       c["dynamics"]["worst_moment"]["timestamp"])
+                      for c in wanted]
+            grabbed = kf.grab(path, [t for _, t in stamps]) if stamps else []
+            if grabbed and enable_sam:
+                seg = Segmenter()
+                if seg.load():
+                    try:
+                        for (ch_idx, t), (_, frame) in zip(stamps, grabbed):
+                            cands = seg.segment_frame(frame)
+                            segments.append({
+                                "chapter_index": ch_idx,
+                                "timestamp": round(t, 2),
+                                "frame_shape": [int(frame.shape[0]),
+                                                int(frame.shape[1])],
+                                "candidates": cands,
+                            })
+                            jpg = kf.to_jpeg(frame)
+                            if jpg:
+                                proof_frames.append((ch_idx, round(t, 2), jpg,
+                                                     cands))
+                    finally:
+                        seg.unload()
+                sam_error = seg.error
+            elif grabbed:
+                for (ch_idx, t), (_, frame) in zip(stamps, grabbed):
+                    jpg = kf.to_jpeg(frame)
+                    if jpg:
+                        proof_frames.append((ch_idx, round(t, 2), jpg, []))
+
+            # The isolated flaw clip, one per proven chapter. Cut here rather
+            # than on demand because the source file is deleted as soon as
+            # this function returns -- by the time the player asks for the
+            # clip there is nothing left to cut it from.
+            by_chapter = {sg["chapter_index"]: sg for sg in segments}
+            for ch_idx, t in (stamps if session_id else ()):
+                meta = clips.extract_flaw(session_id, ch_idx, t, duration, path)
+                if meta and ch_idx in by_chapter:
+                    by_chapter[ch_idx]["flaw_clip"] = meta
+
+            # The good rep for each proven chapter, so the report can show the
+            # fault beside the same lifter doing it right. No SAM: there is no
+            # flaw to outline, and the image encoder is the expensive half of
+            # Stage C.
+            best_stamps = [(c["chapter_index"], bt) for c in wanted
+                           if (bt := ((c.get("reps") or {})
+                                      .get("best_rep") or {}).get("timestamp_s"))
+                           is not None]
+            if best_stamps:
+                for (ch_idx, t), (_, frame) in zip(
+                        best_stamps, kf.grab(path, [t for _, t in best_stamps])):
+                    jpg = kf.to_jpeg(frame)
+                    if jpg:
+                        best_frames.append((ch_idx, round(t, 2), jpg))
+        finally:
+            grabbed = None
+            _release("stage_c")
+        t_c = time.perf_counter()
+        vram_c = _vram_mb()
+
+        # --- Stage D -------------------------------------------------------
+        try:
+            if enable_gemini:
+                report, source = stage_d_timeline(path, mime_type, size_bytes,
+                                                  analysed, proof_frames,
+                                                  duration, context_frames)
+            else:
+                report, source = None, "disabled"
+        finally:
+            proof_frames = context_frames = None
+            _release("stage_d")
+        t_d = time.perf_counter()
+    finally:
+        # Belt and braces. If any stage raised past its own finally, this still
+        # runs before the exception reaches the endpoint.
+        _release("run_analysis")
+
+    timeline, mode = _build_timeline(analysed, segments, report)
+    if report is None:
+        source = f"local-fallback (gemini unavailable: {source})"
+
+    # The longest exercise chapter stands in for the session in the flat view.
+    primary = max(timeline, key=lambda b: b["duration_s"], default=None) or {}
+
+    return {
+        "session_duration_s": duration,
+        **chapters.summarize(chapter_spans),
+        "timeline": timeline,
+        "analysis_source": source,
+        "analysis_mode": mode,
+
+        # Flat view of the dominant chapter. A single-exercise clip is the
+        # common case and every existing client reads these fields; making
+        # them all dig into timeline[0] to learn what was just uploaded would
+        # be a breaking change for no gain.
+        "activity_detected": primary.get("exercise_name"),
+        "session_type": "gym_reps" if reps.get("total_reps") else "sports_drill",
+        "form_score": primary.get("form_score"),
+        "total_reps": (sum(b.get("total_reps") or 0 for b in timeline)
+                       or reps.get("total_reps", 0)),
+        "best_rep": primary.get("best_rep"),
+        "worst_rep": primary.get("worst_rep"),
+        "visual_proof": primary.get("visual_proof"),
+        "actionable_cue": primary.get("actionable_cue"),
+        "phases": primary.get("phases") or [],
+        "synthesis_note": (local_coach.OFFLINE_NOTE
+                           if mode == "local-fallback" else None),
+
+        "local_measurements": {
+            "duration_s": duration,
+            "windows": len(embeddings),
+            "window_seconds": WINDOW_SECONDS,
+            "embedding_dim": int(embeddings[0].shape[0]),
+            "gym_classifier": {
+                "note": "27-class gym model, ~44% val accuracy. Meaningless "
+                        "off gym footage.",
+                "dominant": gym_read,
+                "mean_confidence": gym_conf,
+                "timeline": gym_timeline,
+            },
+            "latent_dynamics": dynamics,
+            "repetitions": reps,
+            "chapters": [{k: v for k, v in c.items()
+                          if k not in ("dynamics", "reps")} for c in analysed],
+            "segmentation": {
+                "model": "sam2.1-hiera-tiny" if enable_sam else "disabled",
+                "error": sam_error,
+                "keyframes": segments,
+            },
+        },
+        "timing_ms": {
+            "stage_a_vjepa": round((t_a - t0) * 1000, 1),
+            "stage_b_dynamics": round((t_b - t_a) * 1000, 1),
+            "stage_c_sam": round((t_c - t_b) * 1000, 1),
+            "stage_d_gemini": round((t_d - t_c) * 1000, 1),
+            "total": round((t_d - t0) * 1000, 1),
+        },
+        "resource_usage": {
+            "vram_mb": {"start": vram_start, "after_stage_a": vram_a,
+                        "after_stage_c": vram_c, "end": _vram_mb()},
+            "commit": {k: v for k, v in health.memory_status().items()
+                       if k.startswith("commit")},
+        },
+    }
+
+
+# --------------------------------------------------------------------------
+# Matching a chosen box back to the mask it came from
+# --------------------------------------------------------------------------
+
+# Below this overlap the chosen box is not any candidate's box, so no contour
+# is attached and the frontend falls back to drawing the rectangle. 0.6 is
+# loose on purpose: Stage D is told to copy a candidate bbox verbatim (which
+# scores 1.0), so anything materially below that is a box Gemini drew itself,
+# and pinning someone else's mask outline to it would be a fabrication -- a
+# precise-looking outline around a region no model actually segmented.
+CONTOUR_MATCH_IOU = 0.6
+
+
+def _box_iou(a, b):
+    """IoU of two [ymin, xmin, ymax, xmax] boxes."""
+    if not (isinstance(a, (list, tuple)) and isinstance(b, (list, tuple))
+            and len(a) == 4 and len(b) == 4):
+        return 0.0
+    ay0, ax0, ay1, ax1 = a
+    by0, bx0, by1, bx1 = b
+    iw = max(0.0, min(ax1, bx1) - max(ax0, bx0))
+    ih = max(0.0, min(ay1, by1) - max(ay0, by0))
+    inter = iw * ih
+    if inter <= 0:
+        return 0.0
+    ua = max(0.0, ax1 - ax0) * max(0.0, ay1 - ay0)
+    ub = max(0.0, bx1 - bx0) * max(0.0, by1 - by0)
+    union = ua + ub - inter
+    return float(inter / union) if union > 0 else 0.0
+
+
+def match_candidate(bbox, candidates):
+    """The SAM candidate whose box IS this box, or None.
+
+    Stage D returns coordinates, not a candidate id -- it is asked to copy a
+    bbox verbatim, and there is no field in the schema for "which one". So the
+    mask that produced those coordinates has to be recovered by geometry, and
+    only then can its contour and centroid be attached to the proof.
+    """
+    best, best_iou = None, 0.0
+    for c in candidates or ():
+        iou = _box_iou(bbox, c.get("normalized_bbox"))
+        if iou > best_iou:
+            best, best_iou = c, iou
+    return best if best_iou >= CONTOUR_MATCH_IOU else None
+
+
+def _build_timeline(analysed, segments, report):
+    """Merge measured chapters with Gemini's words -> the timeline array.
+
+    Measurements always win on anything measured: time ranges, rep counts and
+    the proof timestamp come from Stages A-C whatever the model said. Gemini
+    supplies naming and judgement only. When it supplied nothing, local_coach
+    fills the same fields deterministically and the mode says so.
+    """
+    said = {}
+    if report:
+        for entry in (report.get("timeline") or []):
+            idx = entry.get("chapter_index")
+            if isinstance(idx, int):
+                said[idx] = entry
+
+    seg_by_chapter = {s["chapter_index"]: s for s in segments}
+    mode = "gemini" if said else "local-fallback"
+
+    out = []
+    for c in analysed:
+        if c["kind"] != "exercise" or not c.get("dynamics"):
+            continue
+        idx = c["chapter_index"]
+        d, r = c["dynamics"], c["reps"] or {}
+        g = said.get(idx) or {}
+        seg = seg_by_chapter.get(idx)
+        wm = d.get("worst_moment") or {}
+
+        proof = None
+        if wm:
+            gp = g.get("visual_proof") or {}
+            cands = (seg or {}).get("candidates") or []
+            bbox = gp.get("normalized_bbox")
+            if not (isinstance(bbox, list) and len(bbox) == 4):
+                bbox = local_coach.pick_box(cands)
+            # Recover the mask behind the chosen box so the overlay can draw
+            # the real outline instead of a rectangle. None is a valid answer
+            # and the frontend handles it: better an honest box than a
+            # confident contour around the wrong thing.
+            hit = match_candidate(bbox, cands)
+            # The isolated 3 s clip, cut in Stage C and carried on the segment
+            # because segments are already the per-chapter record of "what we
+            # extracted from the video here". Absent when the cut failed, and
+            # the player falls back to seeking the full video.
+            clip = (seg or {}).get("flaw_clip") or {}
+            proof = {
+                # Measured, never the model's -- the player seeks to this.
+                "timestamp": _mmss(wm["timestamp"]),
+                "timestamp_s": wm["timestamp"],
+                "target_object": (gp.get("target_object")
+                                  or local_coach.region_of(bbox)),
+                "normalized_bbox": bbox,
+                # [x, y] pairs; see the note on _polygon's coordinate order.
+                "normalized_contour": (hit or {}).get("polygon") or [],
+                "target_joint_center": (hit or {}).get("centroid"),
+                "contour_source": ("sam" if hit else "bbox-only"),
+                # Measured tilt of the segmented region, in degrees from true
+                # vertical, plus how elongated it is. The alignment guide is
+                # drawn from these; a near-round region (low elongation) has
+                # no meaningful axis and the guide declines to draw one.
+                "region_axis_deg": (hit or {}).get("axis_deg"),
+                "region_elongation": (hit or {}).get("elongation"),
+                **clip,
+                "issue": gp.get("issue") or local_coach.issue_text(wm, bbox),
+            }
+
+        name, name_source, note = reconcile_name(c, g.get("exercise_name"))
+        if note:
+            # Loud on purpose. Two independent readings of the same footage
+            # disagreed outright, and whichever one was wrong, that is worth
+            # being able to find in the log afterwards.
+            print(f"  [naming] chapter {idx}: gemini said "
+                  f"{note['gemini_name']!r}, V-JEPA read "
+                  f"{note['vjepa_name']!r} at {note['vjepa_confidence']} "
+                  f"(gate {note['threshold']}) -- "
+                  + ("USING V-JEPA" if name_source == "vjepa-override"
+                     else "keeping gemini"),
+                  # Stage D runs in a background task whose stdout is usually
+                  # a redirected file, and Python block-buffers those. Without
+                  # this the line sits in the buffer until the process exits,
+                  # which for a server means until it is killed -- a warning
+                  # nobody can read while the server is running is not one.
+                  flush=True)
+
+        local = local_coach.chapter_cue(c["label"], wm)
+        # Local values are measurement-derived, not templates, and the drill is
+        # deliberately null offline -- see local_coach.chapter_breakdown.
+        local_bd = local_coach.chapter_breakdown(
+            c["label"], wm, r,
+            region=(proof or {}).get("target_object"))
+        out.append({
+            "chapter_index": idx,
+            "exercise_name": name,
+            "exercise_name_source": name_source,
+            "name_discrepancy": note,
+            "time_range": [c["t_start"], c["t_end"]],
+            "duration_s": c["duration_s"],
+            "total_reps": r.get("total_reps", 0),
+            "rep_confidence": r.get("confidence"),
+            "cadence_per_min": r.get("cadence_per_min"),
+            "form_score": (g.get("form_score")
+                           if isinstance(g.get("form_score"), int)
+                           else local_coach.score_of(d, r)),
+            "best_rep": r.get("best_rep"),
+            "worst_rep": r.get("worst_rep"),
+            "best_rep_timestamp": (r.get("best_rep") or {}).get("timestamp"),
+            "worst_rep_timestamp": (r.get("worst_rep") or {}).get("timestamp"),
+            "observation": g.get("observation") or local["observation"],
+            "mechanical_breakdown": (g.get("mechanical_breakdown")
+                                     or local_bd["mechanical_breakdown"]),
+            "actionable_cue": g.get("actionable_cue") or local["cue"],
+            "corrective_drill": (g.get("corrective_drill")
+                                 or local_bd["corrective_drill"]),
+            # So the card can say which half of it a model actually wrote,
+            # rather than presenting a measurement readout as coaching.
+            "coaching_source": ("gemini" if g.get("mechanical_breakdown")
+                                else "local-measurements"),
+            "visual_proof": proof,
+            "peak_kinetic_error": d.get("peak_kinetic_error"),
+        })
+    return out, mode

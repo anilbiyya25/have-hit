@@ -1,0 +1,54 @@
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+
+# Model checkpoints & large binary files
+checkpoints/*.pt
+checkpoints/*.pth
+checkpoints/*.backup.*
+*.pt
+*.pth
+
+# Database files
+*.db
+*.db.pre-migration.bak
+
+# Log files
+*.log
+*.err
+
+# Video/media files
+*.mp4
+*.avi
+*.mov
+*.wav
+
+# Data directories (large datasets)
+data/clips/
+data/features/
+gym_dataset/
+testdata/
+
+# Cache
+.cache/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Session files
+sid.txt
+
+# Analytics data
+user_analytics.json

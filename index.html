@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Have Hit</title>
+<meta http-equiv="refresh" content="0; url=/">
+<link rel="canonical" href="/">
+<style>
+  html { background:#0A0A0A; color:#fff; }
+  body { margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center;
+         font-family:Geist,ui-sans-serif,system-ui,"Segoe UI",Roboto,sans-serif; }
+  a { color:#C6FF00; }
+  .box { text-align:center; font-size:13px; color:rgba(255,255,255,.55); }
+</style>
+</head>
+<body>
+  <!--
+    This page used to be the live-streaming test console. It posted 1500 ms
+    WebM windows to /predict, and that endpoint no longer exists: the product
+    moved to one asynchronous path, POST /api/v1/analyze-workout.
+
+    Kept as a redirect rather than deleted so existing bookmarks and any
+    hardcoded /console link land somewhere useful instead of a 404.
+  -->
+  <div class="box">
+    Redirecting to the coaching console… <a href="/">continue</a>
+  </div>
+  <script>location.replace("/");</script>
+</body>
+</html>

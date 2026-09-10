@@ -1,0 +1,562 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Have Hit — AI Coaching Console</title>
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+/* Theme lives here rather than in a build step: this console is one static file
+   served by app.py, so there is no pipeline to compile a stylesheet through. */
+tailwind.config = {
+  theme: {
+    extend: {
+      colors: { volt: '#C6FF00', ink: '#0A0A0A', panel: '#0F0F0F', panel2: '#121212', rec: '#FF1A1A' },
+      fontFamily: { sans: ['Geist', 'ui-sans-serif', 'system-ui', 'Segoe UI', 'Roboto', 'sans-serif'] },
+      keyframes: {
+        rise: { '0%': { opacity: 0, transform: 'translateY(8px)' }, '100%': { opacity: 1, transform: 'translateY(0)' } },
+        pop:  { '0%': { transform: 'scale(.96)', opacity: 0 }, '60%': { transform: 'scale(1.02)' }, '100%': { transform: 'scale(1)', opacity: 1 } },
+        scan: { '0%': { transform: 'translateY(0)' }, '100%': { transform: 'translateY(420px)' } },
+        halo: { '0%,100%': { opacity: .25, transform: 'scale(1)' }, '50%': { opacity: .9, transform: 'scale(1.6)' } }
+      },
+      animation: {
+        rise: 'rise .5s ease both',
+        pop:  'pop .4s ease both',
+        scan: 'scan 4.5s linear infinite',
+        halo: 'halo 1.7s ease-in-out infinite'
+      }
+    }
+  }
+}
+</script>
+<style>
+  /* Critical fallback. The Tailwind and Geist CDNs need egress; if the box is
+     offline the page must still be dark and readable rather than unstyled. */
+  html { background:#0A0A0A; color:#fff; }
+  body { margin:0; font-family:Geist,ui-sans-serif,system-ui,"Segoe UI",Roboto,sans-serif; }
+  .scrollbar-none::-webkit-scrollbar { display:none }
+  .scrollbar-none { -ms-overflow-style:none; scrollbar-width:none }
+  /* Bars are written as inline widths from JS; the easing lives here so a
+     repaint every ~1.7 s reads as motion instead of a jump. */
+  .fill { transition: width .55s cubic-bezier(.22,.61,.36,1), background-color .3s ease; }
+</style>
+</head>
+
+<body class="bg-ink text-white font-sans antialiased selection:bg-volt selection:text-black">
+
+<!-- ambient glow -->
+<div class="pointer-events-none fixed -top-40 left-1/2 -translate-x-1/2 w-[900px] h-[400px] bg-volt/[0.055] blur-[120px] rounded-full"></div>
+
+<div class="relative max-w-[1400px] mx-auto px-4 md:px-7 pb-14">
+
+  <!-- ══ HEADER ══ -->
+  <header class="flex items-center justify-between gap-4 py-5 md:py-7">
+    <div class="flex items-center gap-3">
+      <div class="w-9 h-9 rounded-[12px] bg-volt flex items-center justify-center shadow-[0_0_22px_rgba(198,255,0,0.35)] shrink-0">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2.6" stroke-linecap="round">
+          <path d="M6.5 7v10M17.5 7v10M3.5 9.5v5M20.5 9.5v5M6.5 12h11"/>
+        </svg>
+      </div>
+      <div>
+        <h1 class="text-[15px] md:text-[17px] font-black tracking-tight leading-none">HAVE HIT</h1>
+        <p class="text-[9px] md:text-[10px] font-bold tracking-[0.18em] text-white/30 mt-1">AI COACHING CONSOLE</p>
+      </div>
+    </div>
+
+    <div class="flex items-center gap-2">
+      <div id="enginePill" class="flex items-center gap-2 px-3 h-8 rounded-full bg-white/[0.05] border border-white/10 backdrop-blur-xl">
+        <span id="engineDot" class="w-1.5 h-1.5 rounded-full bg-white/30"></span>
+        <span id="engineTxt" class="text-[10px] font-bold tracking-[0.14em] text-white/50">CONNECTING…</span>
+      </div>
+      <a href="/console" class="hidden sm:flex items-center h-8 px-3 rounded-full bg-white/[0.04] border border-white/[0.07] text-[10px] font-bold tracking-[0.14em] text-white/35 hover:text-white/80 hover:border-white/20 transition">
+        LEGACY
+      </a>
+    </div>
+  </header>
+
+  <div class="grid grid-cols-1 lg:grid-cols-12 gap-4">
+
+    <!-- ══ LEFT: VIEWPORT ══ -->
+    <section class="lg:col-span-7 flex flex-col gap-4">
+
+      <div class="relative rounded-[22px] bg-panel border border-white/[0.07] p-3 overflow-hidden animate-rise">
+        <div class="pointer-events-none absolute -right-16 -top-16 w-56 h-56 bg-volt/[0.06] blur-[40px] rounded-full"></div>
+
+        <!-- viewport -->
+        <div class="relative rounded-[16px] overflow-hidden bg-black aspect-[4/3]">
+          <video id="cam" playsinline muted
+                 class="absolute inset-0 w-full h-full object-cover -scale-x-100"></video>
+
+          <!-- idle plate -->
+          <div id="idlePlate" class="absolute inset-0 flex flex-col items-center justify-center gap-3 z-10">
+            <svg width="104" height="160" viewBox="0 0 180 280" class="opacity-[0.09]">
+              <path d="M90 20 C98 20 104 26 104 34 C104 42 98 48 90 48 C82 48 76 42 76 34 C76 26 82 20 90 20 Z M90 48 L90 95 L70 135 L60 195 L75 195 L88 145 L92 145 L105 195 L120 195 L110 135 L110 95 L90 48 Z M60 70 L38 95 M120 70 L142 95"
+                    stroke="white" stroke-width="8" stroke-linecap="round" fill="none"/>
+            </svg>
+            <p class="text-[11px] font-medium tracking-wide text-white/30">Camera offline — engage to begin cognition</p>
+            <div class="flex items-center gap-1.5">
+              <span class="w-3 h-px bg-white/10"></span>
+              <span class="text-[9px] font-bold tracking-[0.18em] text-white/20">V-JEPA 2.1 · FROZEN ENCODER</span>
+              <span class="w-3 h-px bg-white/10"></span>
+            </div>
+          </div>
+
+          <!-- scanline, only while streaming -->
+          <div id="scanline" class="hidden absolute inset-x-0 top-0 h-[2px] bg-gradient-to-r from-transparent via-volt/70 to-transparent animate-scan z-10"></div>
+
+          <!-- corner brackets -->
+          <div class="pointer-events-none absolute inset-0 z-20">
+            <div class="absolute top-0 left-0 w-7 h-7 border-l-[1.5px] border-t-[1.5px] border-white/15 rounded-tl-[14px]"></div>
+            <div class="absolute top-0 right-0 w-7 h-7 border-r-[1.5px] border-t-[1.5px] border-white/15 rounded-tr-[14px]"></div>
+            <div class="absolute bottom-0 left-0 w-7 h-7 border-l-[1.5px] border-b-[1.5px] border-white/15 rounded-bl-[14px]"></div>
+            <div class="absolute bottom-0 right-0 w-7 h-7 border-r-[1.5px] border-b-[1.5px] border-white/15 rounded-br-[14px]"></div>
+          </div>
+
+          <!-- COGNITION STATUS -->
+          <div class="absolute top-3 left-1/2 -translate-x-1/2 z-30">
+            <div id="cogPill" class="flex items-center gap-2 px-3.5 h-8 rounded-full bg-black/70 border border-white/10 backdrop-blur-xl transition-colors duration-300">
+              <span class="relative flex items-center justify-center w-2 h-2">
+                <span id="cogHalo" class="absolute w-2 h-2 rounded-full bg-white/40"></span>
+                <span id="cogDot" class="relative w-1.5 h-1.5 rounded-full bg-white/50"></span>
+              </span>
+              <span id="cogTxt" class="text-[10px] font-black tracking-[0.15em] text-white/60 whitespace-nowrap">AI VISION COGNITION STANDBY</span>
+            </div>
+          </div>
+
+          <!-- REC + window -->
+          <div id="recBadge" class="hidden absolute top-3 right-3 z-30 flex items-center gap-2">
+            <div class="px-2.5 h-7 rounded-full bg-black/70 border border-white/10 backdrop-blur flex items-center gap-1.5">
+              <span id="winTxt" class="text-[10px] font-bold text-white/60 tabular-nums">1500 ms</span>
+            </div>
+            <div class="w-7 h-7 rounded-full bg-rec flex items-center justify-center shadow-[0_0_14px_rgba(255,26,26,0.5)] animate-pulse">
+              <span class="w-2 h-2 rounded-full bg-white"></span>
+            </div>
+          </div>
+
+          <!-- verdict -->
+          <div id="verdict" class="hidden absolute bottom-3 left-3 right-3 z-30">
+            <div class="relative rounded-[16px] bg-volt p-3 shadow-[0_0_30px_rgba(198,255,0,0.4)] overflow-hidden">
+              <div class="absolute -right-6 -top-6 w-24 h-24 bg-black/10 blur-[12px] rounded-full"></div>
+              <div class="relative flex items-center justify-between gap-3">
+                <div class="min-w-0">
+                  <p class="text-[10px] font-bold tracking-[0.16em] text-black/55">ACTIVITY</p>
+                  <p id="vLabel" class="text-[17px] md:text-[19px] font-black tracking-tight text-black leading-none mt-1 truncate">—</p>
+                </div>
+                <div class="text-right shrink-0">
+                  <p class="text-[10px] font-bold tracking-wide text-black/50">V-JEPA</p>
+                  <p id="vConf" class="text-[15px] font-black text-black leading-none mt-1 tabular-nums">—</p>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- controls -->
+        <div class="flex items-center gap-2 mt-3">
+          <button id="startBtn"
+            class="flex-1 h-12 rounded-full bg-volt text-black font-black text-[12px] tracking-[0.14em] hover:brightness-110 active:scale-[.99] transition disabled:opacity-40 disabled:pointer-events-none">
+            ENGAGE COGNITION
+          </button>
+          <button id="stopBtn" disabled
+            class="h-12 px-5 rounded-full bg-white/[0.06] border border-white/10 text-[11px] font-bold tracking-[0.14em] text-white/60 hover:text-white transition disabled:opacity-30 disabled:pointer-events-none">
+            DISENGAGE
+          </button>
+        </div>
+
+        <p id="camErr" class="hidden mt-2.5 text-[11px] text-rec/90 px-1 whitespace-pre-wrap"></p>
+      </div>
+
+      <!-- telemetry -->
+      <div class="grid grid-cols-4 gap-2 animate-rise">
+        <div class="rounded-[14px] bg-panel2 border border-white/[0.06] px-3 py-2.5">
+          <p class="text-[9px] font-bold tracking-[0.14em] text-white/25">DECODE</p>
+          <p class="text-[15px] font-black tabular-nums mt-0.5"><span id="tDecode">—</span><span class="text-[10px] font-medium text-white/30 ml-0.5">ms</span></p>
+        </div>
+        <div class="rounded-[14px] bg-panel2 border border-white/[0.06] px-3 py-2.5">
+          <p class="text-[9px] font-bold tracking-[0.14em] text-white/25">INFERENCE</p>
+          <p class="text-[15px] font-black tabular-nums mt-0.5"><span id="tInfer">—</span><span class="text-[10px] font-medium text-white/30 ml-0.5">ms</span></p>
+        </div>
+        <div class="rounded-[14px] bg-panel2 border border-white/[0.06] px-3 py-2.5">
+          <p class="text-[9px] font-bold tracking-[0.14em] text-white/25">ROUND TRIP</p>
+          <p class="text-[15px] font-black tabular-nums mt-0.5"><span id="tTotal">—</span><span class="text-[10px] font-medium text-white/30 ml-0.5">ms</span></p>
+        </div>
+        <div class="rounded-[14px] bg-panel2 border border-white/[0.06] px-3 py-2.5">
+          <p class="text-[9px] font-bold tracking-[0.14em] text-white/25">WINDOWS</p>
+          <p class="text-[15px] font-black tabular-nums mt-0.5" id="tCount">0</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ══ RIGHT RAIL ══ -->
+    <aside class="lg:col-span-5 flex flex-col gap-4">
+
+      <!-- probabilities -->
+      <div class="rounded-[20px] bg-panel border border-white/[0.07] p-4 animate-rise">
+        <div class="flex items-center justify-between mb-3">
+          <span class="text-[10px] font-bold tracking-[0.16em] text-white/30">CLASS PROBABILITY · LIVE</span>
+          <span class="text-[9px] font-bold tracking-[0.14em] text-volt/60">7 CLASSES</span>
+        </div>
+        <!-- Fixed config order, never re-sorted: bars that reorder while they
+             animate are unreadable. The leader is highlighted instead. -->
+        <div id="bars" class="flex flex-col gap-2.5"></div>
+      </div>
+
+      <!-- session metrics: PLACEHOLDER -->
+      <div class="rounded-[20px] bg-panel border border-white/[0.07] p-4 relative overflow-hidden animate-rise">
+        <div class="pointer-events-none absolute -left-10 -bottom-10 w-32 h-32 bg-volt/[0.05] blur-[28px] rounded-full"></div>
+        <div class="relative">
+          <div class="flex items-center justify-between mb-3">
+            <span class="text-[10px] font-bold tracking-[0.16em] text-white/30">SESSION METRICS</span>
+            <!-- Labelled loudly. These two are NOT model output; downstream rep
+                 counting and form scoring do not exist yet. -->
+            <span class="text-[9px] font-black tracking-[0.12em] px-2 py-1 rounded-full bg-white/[0.06] border border-white/10 text-white/35">PLACEHOLDER</span>
+          </div>
+
+          <div class="grid grid-cols-2 gap-2.5">
+            <!-- reps -->
+            <div class="rounded-[16px] bg-panel2 border border-white/[0.06] p-3">
+              <p class="text-[9px] font-bold tracking-[0.14em] text-white/25">REPS</p>
+              <div class="flex items-end justify-between mt-1.5">
+                <p class="text-[30px] font-black tracking-tighter leading-none tabular-nums" id="reps">0</p>
+                <div class="flex gap-1.5">
+                  <button id="repMinus" class="w-7 h-7 rounded-full bg-white/[0.06] border border-white/10 text-white/60 text-[15px] leading-none font-bold hover:bg-white/[0.12] transition">−</button>
+                  <button id="repPlus"  class="w-7 h-7 rounded-full bg-volt text-black text-[15px] leading-none font-bold hover:brightness-110 transition">+</button>
+                </div>
+              </div>
+              <p class="text-[10px] text-white/30 mt-2">Manual · awaiting auto-count</p>
+            </div>
+
+            <!-- form -->
+            <div class="rounded-[16px] bg-panel2 border border-white/[0.06] p-3">
+              <p class="text-[9px] font-bold tracking-[0.14em] text-white/25">FORM QUALITY SCORE</p>
+              <div class="flex items-center gap-3 mt-1.5">
+                <div class="relative w-11 h-11 shrink-0">
+                  <svg viewBox="0 0 36 36" class="w-11 h-11 -rotate-90">
+                    <circle cx="18" cy="18" r="14" fill="none" stroke="white" stroke-opacity="0.1" stroke-width="3"/>
+                    <circle id="formArc" cx="18" cy="18" r="14" fill="none" stroke="#C6FF00" stroke-width="3"
+                            stroke-linecap="round" stroke-dasharray="87.9 87.9" class="transition-all duration-700"/>
+                  </svg>
+                </div>
+                <div>
+                  <p class="text-[22px] font-black tracking-tighter leading-none tabular-nums"><span id="formScore">100</span>%</p>
+                  <p class="text-[10px] text-white/30 mt-1">Static default</p>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="mt-2.5 rounded-[13px] bg-white/[0.03] border border-white/[0.06] px-3 py-2 flex items-center gap-2">
+            <span class="w-1.5 h-1.5 rounded-full bg-white/25 shrink-0"></span>
+            <p class="text-[10px] text-white/35 leading-snug">Layout wired for downstream logic. The model classifies the exercise only — it does not count reps or judge form.</p>
+          </div>
+        </div>
+      </div>
+
+      <!-- history -->
+      <div class="rounded-[20px] bg-panel border border-white/[0.07] p-4 animate-rise">
+        <div class="flex items-center justify-between mb-3">
+          <span class="text-[10px] font-bold tracking-[0.16em] text-white/30">SESSION WORKOUT HISTORY</span>
+          <span class="text-[9px] font-bold tracking-[0.14em] text-white/20" id="histMeta">user_analytics.json</span>
+        </div>
+        <div id="hist" class="flex flex-col gap-2 max-h-[300px] overflow-y-auto scrollbar-none"></div>
+      </div>
+    </aside>
+  </div>
+</div>
+
+<script>
+'use strict';
+
+const API = location.origin.startsWith('http') ? '' : 'http://127.0.0.1:8000';
+const $ = s => document.querySelector(s);
+const pretty = s => s.replace(/_/g, ' ');
+
+/* Streaming window. The head was trained on clips spanning seconds, so a
+   window much below ~1 s holds too little movement to classify. */
+const WINDOW_MS = 1500;
+/* Same exercise for this many consecutive windows before it counts as a set.
+   Two windows is ~3.4 s of agreement, enough to reject a single-frame flicker. */
+const SET_MIN_WINDOWS = 2;
+
+const FALLBACK_CLASSES = ['squats','push_ups','barbell_squat','bench_press','barbell_row','bicep_curl','shoulder_press'];
+
+/* ───────── engine status ───────── */
+async function health() {
+  try {
+    const j = await (await fetch(API + '/health')).json();
+    $('#engineDot').className = 'w-1.5 h-1.5 rounded-full ' + (j.warm ? 'bg-volt shadow-[0_0_6px_#C6FF00]' : 'bg-amber-400');
+    $('#engineTxt').textContent = j.warm ? `ENGINE WARM · ${j.device.toUpperCase()}` : 'ENGINE LOADING…';
+    $('#engineTxt').className = 'text-[10px] font-bold tracking-[0.14em] ' + (j.warm ? 'text-white/70' : 'text-amber-300/80');
+    return j.warm;
+  } catch {
+    $('#engineDot').className = 'w-1.5 h-1.5 rounded-full bg-rec';
+    $('#engineTxt').textContent = 'API UNREACHABLE';
+    $('#engineTxt').className = 'text-[10px] font-bold tracking-[0.14em] text-rec/80';
+    return false;
+  }
+}
+health(); setInterval(health, 5000);
+
+/* ───────── cognition indicator ───────── */
+function cognition(state) {
+  const pill = $('#cogPill'), dot = $('#cogDot'), halo = $('#cogHalo'), txt = $('#cogTxt');
+  if (state === 'active') {
+    pill.className = 'flex items-center gap-2 px-3.5 h-8 rounded-full bg-volt/[0.14] border border-volt/40 backdrop-blur-xl transition-colors duration-300 shadow-[0_0_20px_rgba(198,255,0,0.18)]';
+    dot.className  = 'relative w-1.5 h-1.5 rounded-full bg-volt';
+    halo.className = 'absolute w-2 h-2 rounded-full bg-volt animate-halo';
+    txt.className  = 'text-[10px] font-black tracking-[0.15em] text-volt whitespace-nowrap';
+    txt.textContent = 'AI VISION COGNITION ACTIVE';
+  } else {
+    pill.className = 'flex items-center gap-2 px-3.5 h-8 rounded-full bg-black/70 border border-white/10 backdrop-blur-xl transition-colors duration-300';
+    dot.className  = 'relative w-1.5 h-1.5 rounded-full bg-white/50';
+    halo.className = 'absolute w-2 h-2 rounded-full bg-white/40';
+    txt.className  = 'text-[10px] font-black tracking-[0.15em] text-white/60 whitespace-nowrap';
+    txt.textContent = 'AI VISION COGNITION STANDBY';
+  }
+}
+
+/* ───────── probability bars ───────── */
+let CLASSES = [];
+
+function buildBars(classes) {
+  CLASSES = classes;
+  $('#bars').innerHTML = classes.map(c => `
+    <div class="bar" data-c="${c}">
+      <div class="flex items-center justify-between mb-1.5">
+        <span class="name text-[11px] font-semibold tracking-tight text-white/45 transition-colors">${pretty(c)}</span>
+        <span class="pct text-[11px] font-black tabular-nums text-white/30 transition-colors">0.0%</span>
+      </div>
+      <div class="h-1.5 rounded-full bg-white/[0.06] overflow-hidden">
+        <div class="fill h-full rounded-full bg-white/20" style="width:0%"></div>
+      </div>
+    </div>`).join('');
+}
+
+function paintBars(probs, top) {
+  for (const el of document.querySelectorAll('.bar')) {
+    const c = el.dataset.c, v = (probs?.[c] ?? 0) * 100, lead = c === top;
+    el.querySelector('.fill').style.width = v.toFixed(1) + '%';
+    el.querySelector('.fill').className = 'fill h-full rounded-full ' +
+      (lead ? 'bg-volt shadow-[0_0_10px_rgba(198,255,0,0.45)]' : 'bg-white/20');
+    el.querySelector('.pct').textContent = v.toFixed(1) + '%';
+    el.querySelector('.pct').className = 'pct text-[11px] font-black tabular-nums transition-colors ' + (lead ? 'text-volt' : 'text-white/30');
+    el.querySelector('.name').className = 'name text-[11px] font-semibold tracking-tight transition-colors ' + (lead ? 'text-white' : 'text-white/45');
+  }
+}
+
+async function loadClasses() {
+  try {
+    const j = await (await fetch(API + '/classes')).json();
+    buildBars(j.classes);
+  } catch {
+    buildBars(FALLBACK_CLASSES);   // keep the layout intact; header shows the fault
+  }
+}
+
+/* ───────── placeholder metrics ───────── */
+let reps = 0;
+const FORM_SCORE = 100;
+function paintReps() { $('#reps').textContent = reps; }
+$('#repPlus').onclick  = () => { reps++; paintReps(); };
+$('#repMinus').onclick = () => { reps = Math.max(0, reps - 1); paintReps(); };
+$('#formArc').setAttribute('stroke-dasharray', `${(FORM_SCORE / 100) * 87.9} 87.9`);
+$('#formScore').textContent = FORM_SCORE;
+
+/* ───────── history ───────── */
+const ago = ts => {
+  const s = Math.max(0, (Date.now() - new Date(ts).getTime()) / 1000);
+  if (s < 60) return `${s | 0}s ago`;
+  if (s < 3600) return `${s / 60 | 0}m ago`;
+  if (s < 86400) return `${s / 3600 | 0}h ago`;
+  return `${s / 86400 | 0}d ago`;
+};
+
+function paintHistory(sets) {
+  const el = $('#hist');
+  if (!sets.length) {
+    el.innerHTML = `
+      <div class="rounded-[14px] border border-dashed border-white/[0.09] px-3 py-6 text-center">
+        <p class="text-[11px] text-white/30">No sets logged yet</p>
+        <p class="text-[10px] text-white/20 mt-1">A set is recorded once one exercise holds for ${SET_MIN_WINDOWS} consecutive windows</p>
+      </div>`;
+    $('#histMeta').textContent = 'user_analytics.json · empty';
+    return;
+  }
+  $('#histMeta').textContent = `${sets.length} SET${sets.length > 1 ? 'S' : ''}`;
+  el.innerHTML = sets.slice().reverse().map((s, i) => `
+    <div class="rounded-[14px] bg-panel2 border border-white/[0.06] px-3 py-2.5 flex items-center gap-2.5 animate-rise" style="animation-delay:${Math.min(i, 6) * 0.04}s">
+      <div class="w-7 h-7 rounded-full ${i === 0 ? 'bg-volt/15 border-volt/25' : 'bg-white/[0.06] border-white/10'} border flex items-center justify-center shrink-0">
+        <span class="w-1.5 h-1.5 rounded-full ${i === 0 ? 'bg-volt' : 'bg-white/35'}"></span>
+      </div>
+      <div class="flex-1 min-w-0">
+        <p class="text-[12px] font-bold tracking-tight text-white/90 truncate">${pretty(s.exercise)}</p>
+        <p class="text-[10px] text-white/30 tabular-nums">${ago(s.ts)} · ${s.duration_s}s · ${s.reps} reps</p>
+      </div>
+      <span class="text-[10px] font-black tabular-nums px-2 py-1 rounded-full ${i === 0 ? 'bg-volt text-black' : 'bg-white/[0.06] text-white/45'} shrink-0">
+        ${(s.confidence * 100).toFixed(0)}%
+      </span>
+    </div>`).join('');
+}
+
+async function loadHistory() {
+  try { paintHistory((await (await fetch(API + '/analytics')).json()).sets || []); }
+  catch { paintHistory([]); }
+}
+
+async function logSet(entry) {
+  try {
+    const r = await fetch(API + '/analytics', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(entry)
+    });
+    if (r.ok) paintHistory((await r.json()).sets || []);
+  } catch { /* history is a nicety; never let it break the stream */ }
+}
+
+/* ───────── streaming ───────── */
+let stream = null, running = false, windows = 0;
+let run = null;   // { exercise, windows, peak, startedAt }
+
+function pickMime() {
+  return ['video/webm;codecs=vp9','video/webm;codecs=vp8','video/webm','video/mp4']
+    .find(m => MediaRecorder.isTypeSupported(m)) || '';
+}
+
+/* Each clip is recorded start-to-stop so the blob is a COMPLETE container.
+   MediaRecorder.start(timeslice) looks like the obvious way to stream every
+   1500 ms, but only the first chunk of a timesliced recording carries the
+   WebM header — every later chunk is undecodable alone and the server would
+   reject all of them. */
+function recordClip(ms) {
+  return new Promise((resolve, reject) => {
+    const chunks = [], mime = pickMime();
+    const rec = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
+    rec.ondataavailable = e => e.data.size && chunks.push(e.data);
+    rec.onstop = () => resolve(new Blob(chunks, { type: rec.mimeType || 'video/webm' }));
+    rec.onerror = reject;
+    rec.start();
+    setTimeout(() => rec.state !== 'inactive' && rec.stop(), ms);
+  });
+}
+
+async function predict(blob) {
+  const r = await fetch(API + '/predict', {
+    method: 'POST', body: blob, headers: { 'Content-Type': 'application/octet-stream' }
+  });
+  if (!r.ok) throw new Error(`HTTP ${r.status}: ${(await r.text()).slice(0, 180)}`);
+  return r.json();
+}
+
+/* A set closes when the leading exercise changes, or when the stream stops. */
+function closeRun() {
+  if (run && run.windows >= SET_MIN_WINDOWS) {
+    logSet({
+      exercise: run.exercise,
+      confidence: run.peak,
+      reps,
+      windows: run.windows,
+      duration_s: +((Date.now() - run.startedAt) / 1000).toFixed(1)
+    });
+  }
+  run = null;
+}
+
+function track(label, conf) {
+  if (run && run.exercise === label) {
+    run.windows++;
+    run.peak = Math.max(run.peak, conf);
+  } else {
+    closeRun();
+    run = { exercise: label, windows: 1, peak: conf, startedAt: Date.now() };
+  }
+}
+
+function paint(j) {
+  $('#vLabel').textContent = pretty(j.exercise);
+  $('#vConf').textContent = (j.confidence * 100).toFixed(1) + '%';
+  paintBars(j.probabilities, j.exercise);
+  $('#tDecode').textContent = j.timing_ms.decode;
+  $('#tInfer').textContent  = j.timing_ms.inference;
+  $('#tTotal').textContent  = j.timing_ms.total;
+  $('#tCount').textContent  = ++windows;
+}
+
+function showErr(msg) {
+  const el = $('#camErr');
+  if (!msg) { el.classList.add('hidden'); el.textContent = ''; return; }
+  el.classList.remove('hidden'); el.textContent = msg;
+}
+
+$('#startBtn').onclick = async () => {
+  showErr('');
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 30 } }, audio: false
+    });
+  } catch (e) {
+    showErr('Camera denied or unavailable: ' + e.message);
+    return;
+  }
+
+  $('#cam').srcObject = stream;
+  await $('#cam').play();
+
+  running = true;
+  $('#startBtn').disabled = true;
+  $('#stopBtn').disabled = false;
+  $('#idlePlate').classList.add('hidden');
+  $('#scanline').classList.remove('hidden');
+  $('#recBadge').classList.remove('hidden');
+  $('#verdict').classList.remove('hidden');
+  $('#winTxt').textContent = WINDOW_MS + ' ms';
+  $('#vLabel').textContent = 'reading…';
+  cognition('active');
+
+  /* The loop is await-driven: recording and the network round trip both yield
+     to the event loop, so the preview keeps painting at camera framerate and
+     the buttons stay responsive while the GPU works. Nothing here is
+     synchronous for longer than a style write. */
+  while (running) {
+    try {
+      const blob = await recordClip(WINDOW_MS);
+      if (!running) break;
+      const j = await predict(blob);
+      if (!running) break;
+      paint(j);
+      track(j.exercise, j.confidence);
+      showErr('');
+    } catch (err) {
+      showErr(err.message);
+      await new Promise(r => setTimeout(r, 700));   // back off, do not hot-loop
+    }
+  }
+};
+
+$('#stopBtn').onclick = () => {
+  running = false;
+  closeRun();
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  stream = null;
+  $('#cam').srcObject = null;
+  $('#startBtn').disabled = false;
+  $('#stopBtn').disabled = true;
+  $('#idlePlate').classList.remove('hidden');
+  $('#scanline').classList.add('hidden');
+  $('#recBadge').classList.add('hidden');
+  $('#verdict').classList.add('hidden');
+  cognition('standby');
+  paintBars({}, null);
+};
+
+/* Flush an in-flight set if the tab closes mid-stream. */
+window.addEventListener('pagehide', () => { if (run) closeRun(); });
+
+loadClasses();
+loadHistory();
+paintReps();
+</script>
+</body>
+</html>

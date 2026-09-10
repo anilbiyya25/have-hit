@@ -1,0 +1,285 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- viewport-fit=cover keeps the layout under the notch on a propped-up phone.
+     user-scalable=no + maximum-scale=1 stop a double-tap on Record or Stop
+     from zooming the page mid-set. Two things worth knowing about that:
+     iOS Safari has ignored user-scalable since iOS 10 (the CSS
+     touch-action rule below is what actually works there), and disabling
+     zoom is normally an accessibility regression -- it is accepted here
+     only because the controls are already large and are operated at arm's
+     length with a phone propped against a bench. -->
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#0A0A0A">
+<title>Have Hit — AI Coach</title>
+
+<!-- Installable shell. iOS reads the apple-* tags and ignores the manifest's
+     display mode; Android Chrome reads the manifest and ignores these. Both
+     are needed, and neither is a duplicate of the other. -->
+<link rel="manifest" href="/manifest.json">
+<link rel="apple-touch-icon" href="/static/icons/apple-touch-icon.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Have Hit">
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+tailwind.config = {
+  theme: {
+    extend: {
+      colors: {
+        volt: '#C6FF00', ink: '#0A0A0A', panel: '#0F0F0F', panel2: '#121212',
+        rec: '#FF1A1A', warn: '#FFB020', crit: '#FF4D4D'
+      },
+      fontFamily: { sans: ['Geist', 'ui-sans-serif', 'system-ui', 'Segoe UI', 'Roboto', 'sans-serif'] },
+      keyframes: {
+        rise: { '0%': { opacity: 0, transform: 'translateY(8px)' }, '100%': { opacity: 1, transform: 'translateY(0)' } },
+        halo: { '0%,100%': { opacity: .25, transform: 'scale(1)' }, '50%': { opacity: .9, transform: 'scale(1.6)' } },
+        sweep: { '0%': { transform: 'translateX(-100%)' }, '100%': { transform: 'translateX(300%)' } }
+      },
+      animation: { rise: 'rise .5s ease both', halo: 'halo 1.7s ease-in-out infinite', sweep: 'sweep 1.4s linear infinite' }
+    }
+  }
+}
+</script>
+<style>
+  /* Critical fallback: the Tailwind and Geist CDNs need egress. If they are
+     blocked the console must still be dark and readable. */
+  html { background:#0A0A0A; color:#fff; -webkit-text-size-adjust:100%; }
+  body { margin:0; font-family:Geist,ui-sans-serif,system-ui,"Segoe UI",Roboto,sans-serif; }
+  .scrollbar-none::-webkit-scrollbar { display:none }
+  .scrollbar-none { -ms-overflow-style:none; scrollbar-width:none }
+  /* The overlay must not swallow taps meant for the video's own controls. */
+  #overlay { pointer-events:none; }
+  /* Respect the home-indicator area so the last card is not cut off. */
+  .safe-bottom { padding-bottom: calc(4rem + env(safe-area-inset-bottom)); }
+  /* This, not the viewport meta, is what actually kills double-tap zoom on
+     iOS Safari -- it has ignored user-scalable=no since iOS 10. Scoped to
+     controls so the report text can still be pinch-zoomed if someone needs
+     to read it. */
+  button, a, label, input, summary, #seekBar { touch-action: manipulation; }
+  /* The stage fills the screen in fullscreen; the video inside it keeps its
+     aspect ratio and the overlay canvas is positioned onto the video's real
+     box by fit(), not onto the stage. */
+  #stage:fullscreen, #stage:-webkit-full-screen { width: 100vw; height: 100vh; }
+  #stage:fullscreen video, #stage:-webkit-full-screen video { max-height: 100vh; }
+</style>
+</head>
+
+<body class="bg-ink text-white font-sans antialiased selection:bg-volt selection:text-black">
+
+<div class="pointer-events-none fixed -top-40 left-1/2 -translate-x-1/2 w-[900px] h-[380px] bg-volt/[0.05] blur-[120px] rounded-full"></div>
+
+<div class="relative max-w-[1240px] mx-auto px-4 sm:px-5 md:px-8 safe-bottom">
+
+  <header class="flex items-center justify-between py-5 sm:py-6">
+    <div class="flex items-center gap-2.5">
+      <div class="w-7 h-7 rounded-[10px] bg-volt flex items-center justify-center shrink-0">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2.6" stroke-linecap="round">
+          <path d="M6.5 7v10M17.5 7v10M3.5 9.5v5M20.5 9.5v5M6.5 12h11"/>
+        </svg>
+      </div>
+      <span class="text-[14px] font-black tracking-tight">HAVE HIT</span>
+    </div>
+    <div class="flex items-center gap-2">
+      <span id="engineDot" class="w-1.5 h-1.5 rounded-full bg-white/25"></span>
+      <span id="engineTxt" class="hidden sm:inline text-[10px] font-bold tracking-[0.14em] text-white/35">CONNECTING…</span>
+
+      <!-- Voice state. Hidden until the speech engine has actually been primed
+           by a user gesture, because before that a mobile browser will refuse
+           to speak and an "active" light would be a lie. -->
+      <span id="voicePill" class="hidden items-center gap-1.5 px-2 py-1 rounded-full bg-volt/[0.12] border border-volt/20 ml-1">
+        <span class="relative flex w-1.5 h-1.5">
+          <span class="absolute inline-flex w-full h-full rounded-full bg-volt animate-halo"></span>
+          <span class="relative inline-flex w-1.5 h-1.5 rounded-full bg-volt"></span>
+        </span>
+        <span class="hidden sm:inline text-[9px] font-black tracking-[0.12em] text-volt">VOICE COACH ACTIVE</span>
+      </span>
+
+      <button id="testAudioBtn" title="Test coaching audio"
+        class="w-8 h-8 rounded-lg flex items-center justify-center bg-white/[0.06] text-white/50 hover:text-white transition active:scale-95">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M11 5 6 9H2v6h4l5 4V5z"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/><path d="M19 5a9 9 0 0 1 0 14"/>
+        </svg>
+      </button>
+      <button id="muteBtn" aria-pressed="true" title="Coaching audio"
+        class="w-8 h-8 rounded-lg flex items-center justify-center transition bg-volt/15 text-volt"></button>
+      <button id="historyBtn" title="Past workouts"
+        class="w-8 h-8 rounded-lg flex items-center justify-center bg-white/[0.06] text-white/50 hover:text-white transition">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M3 3v5h5"/><path d="M3.05 13A9 9 0 1 0 6 5.3L3 8"/><path d="M12 7v5l4 2"/>
+        </svg>
+      </button>
+    </div>
+  </header>
+
+  <!-- ══ MODE SWITCH — full width on phones so both targets are thumb-sized ══ -->
+  <div class="flex items-center gap-1 p-1 rounded-2xl bg-panel border border-white/[0.06] w-full sm:w-fit mb-4 sm:mb-5">
+    <button id="tabRecord" data-tab="record"
+      class="tab flex-1 sm:flex-none px-4 sm:px-5 py-2.5 rounded-xl text-[12px] font-bold tracking-tight transition-all bg-volt text-black">
+      Record Set
+    </button>
+    <button id="tabVault" data-tab="vault"
+      class="tab flex-1 sm:flex-none px-4 sm:px-5 py-2.5 rounded-xl text-[12px] font-bold tracking-tight transition-all text-white/50 hover:text-white/80">
+      Video Vault
+    </button>
+  </div>
+
+  <!-- ══ PANE: RECORD ══ -->
+  <section id="paneRecord" class="pane">
+    <div class="rounded-3xl bg-panel border border-white/[0.06] overflow-hidden">
+      <!-- Portrait by default: a phone propped on a bench films a standing
+           body, and 16:9 crops the head and feet off exactly that shot.
+           Widescreen returns on tablets and desktops. -->
+      <div class="relative bg-black aspect-[3/4] sm:aspect-video">
+        <!-- object-contain, not cover: the lifter must see the TRUE framing
+             while positioning themselves, and cover silently hides the edges
+             that decide whether their feet are in shot. -->
+        <video id="cam" class="w-full h-full object-contain" playsinline muted autoplay></video>
+
+        <div id="camIdle" class="absolute inset-0 flex flex-col items-center justify-center gap-3 text-center px-6">
+          <div class="text-[13px] font-bold text-white/60">Camera is off</div>
+          <div class="text-[11px] text-white/35 max-w-[320px]">Prop your phone against something so your whole body stays in frame, then start the camera.</div>
+          <button id="camStart" class="mt-1 px-5 py-3 rounded-xl bg-white/10 hover:bg-white/[0.16] text-[12px] font-bold transition active:scale-95">Enable camera</button>
+        </div>
+
+        <div id="recBadge" class="hidden absolute top-4 left-4 flex items-center gap-2 px-3 py-1.5 rounded-full bg-black/70 backdrop-blur border border-white/10">
+          <span class="relative flex w-2 h-2">
+            <span class="absolute inline-flex w-full h-full rounded-full bg-rec animate-halo"></span>
+            <span class="relative inline-flex w-2 h-2 rounded-full bg-rec"></span>
+          </span>
+          <span class="text-[11px] font-bold tracking-wider">REC</span>
+          <span id="recTime" class="text-[11px] font-bold tabular-nums text-white/70">0:00</span>
+        </div>
+
+        <!-- Flip control, shown only when the device actually has two cameras -->
+        <button id="camFlip" class="hidden absolute top-4 right-4 h-10 px-3 gap-2 rounded-full bg-black/70 backdrop-blur border border-white/10 flex items-center justify-center active:scale-95 transition">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M17 2l4 4-4 4"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/>
+            <path d="M7 22l-4-4 4-4"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/>
+          </svg>
+          <span id="camFlipLabel" class="text-[11px] font-bold">Front</span>
+        </button>
+      </div>
+
+      <div class="p-4 space-y-2.5">
+        <button id="recBtn" disabled
+          class="w-full px-5 py-4 rounded-2xl bg-volt text-black text-[14px] font-black tracking-tight disabled:opacity-30 disabled:cursor-not-allowed transition hover:brightness-110">
+          Start Recording
+        </button>
+        <div class="flex items-center justify-between text-[10px] text-white/30">
+          <span id="camLabel">Camera off</span>
+          <span>Uploads only when you press stop</span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ══ PANE: VAULT ══ -->
+  <section id="paneVault" class="pane hidden">
+    <label id="drop" for="fileInput"
+      class="block rounded-3xl bg-panel border-2 border-dashed border-white/[0.10] hover:border-volt/40 transition cursor-pointer">
+      <div class="flex flex-col items-center justify-center text-center py-14 sm:py-20 px-6 gap-3">
+        <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="#C6FF00" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v13"/>
+        </svg>
+        <div class="text-[14px] font-bold">Tap to choose a video</div>
+        <div class="text-[11px] text-white/35 max-w-[420px]">
+          Any physical activity — a gym lift, a golf swing, a tennis serve, a sprint drill.
+          MP4, MOV, WebM or MKV up to 256&nbsp;MB.
+        </div>
+      </div>
+      <input id="fileInput" type="file" accept="video/*" class="hidden">
+    </label>
+  </section>
+
+  <!-- ══ PROGRESS ══ -->
+  <section id="progress" class="hidden mt-4 sm:mt-5 rounded-3xl bg-panel border border-white/[0.06] p-4 sm:p-5">
+    <div class="flex items-center justify-between mb-3">
+      <span id="progLabel" class="text-[12px] font-bold">Analysing…</span>
+      <span id="progTime" class="text-[11px] font-bold tabular-nums text-white/40">0.0s</span>
+    </div>
+    <div class="h-1 rounded-full bg-white/[0.06] overflow-hidden">
+      <div class="h-full w-1/3 bg-volt/70 animate-sweep"></div>
+    </div>
+    <div id="progStages" class="mt-3 flex flex-wrap gap-1.5 text-[10px] font-bold tracking-wide"></div>
+  </section>
+
+  <!-- ══ ERROR ══ -->
+  <section id="errBox" class="hidden mt-4 sm:mt-5 rounded-2xl border border-crit/30 bg-crit/[0.07] p-4">
+    <div class="text-[12px] font-bold text-crit mb-1">Analysis failed</div>
+    <div id="errMsg" class="text-[11px] text-white/60 leading-relaxed"></div>
+  </section>
+
+  <!-- ══ REPORT ══ -->
+  <section id="report" class="hidden mt-4 sm:mt-5 space-y-4 sm:space-y-5"></section>
+
+</div>
+
+<!-- ══ HISTORY DRAWER ══ -->
+<div id="historyScrim" class="hidden fixed inset-0 bg-black/60 backdrop-blur-sm z-40"></div>
+<aside id="historyDrawer"
+  class="fixed top-0 right-0 h-full w-full sm:w-[420px] bg-panel border-l border-white/[0.08] z-50
+         translate-x-full transition-transform duration-300 ease-out flex flex-col">
+  <div class="flex items-center gap-3 px-5 py-5 border-b border-white/[0.06] shrink-0">
+    <div>
+      <div class="text-[13px] font-black">Past Workouts</div>
+      <div id="historyCount" class="text-[10px] text-white/30">—</div>
+    </div>
+    <!-- A real link, not a fetch+blob: the endpoint already sets
+         Content-Disposition, so the browser's own download path handles the
+         file and nothing has to be held in memory to save it. -->
+    <a id="exportBtn" href="/api/v1/history/export" download
+       class="ml-auto flex items-center gap-1.5 px-3 py-2 rounded-lg bg-white/[0.06] text-white/60 hover:text-white text-[10px] font-bold transition active:scale-95">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/>
+      </svg>
+      Export
+    </a>
+    <button id="historyClose"
+      class="w-8 h-8 rounded-lg bg-white/[0.06] text-white/50 hover:text-white flex items-center justify-center transition">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+        <path d="M18 6 6 18M6 6l12 12"/>
+      </svg>
+    </button>
+  </div>
+  <!-- Health sits ABOVE the scroll container, not inside it: it summarises
+       every row below and would otherwise scroll away exactly when you start
+       comparing it against the sessions it describes. -->
+  <div id="healthCard" class="shrink-0 px-4 pt-4"></div>
+  <!-- own scroll container so the header stays put on a phone -->
+  <div id="historyList" class="flex-1 overflow-y-auto p-4 space-y-2.5"></div>
+  <!-- Maintenance lives at the bottom, outside the scroll area: it is not a
+       workout and should not sit in the list of them, and a destructive
+       control should not scroll under a thumb reaching for a row. -->
+  <div class="shrink-0 px-4 py-3 border-t border-white/[0.06]"
+       style="padding-bottom: calc(0.75rem + env(safe-area-inset-bottom))">
+    <button id="purgeBtn"
+      class="w-full px-3 py-2.5 rounded-xl bg-white/[0.04] hover:bg-crit/10 text-white/40 hover:text-crit text-[10px] font-bold transition active:scale-95">
+      Clear test data (sessions with no visual proof)
+    </button>
+    <div id="purgeNote" class="text-[9px] text-white/25 mt-1.5 leading-relaxed"></div>
+  </div>
+</aside>
+
+<!-- ?v= is the app.js mtime, substituted by _page() in app.py. Without it
+     the browser heuristically caches an unversioned /static/js/app.js and
+     keeps running yesterday's UI against today's API. -->
+<script src="/static/js/app.js?v=__ASSET_V__"></script>
+<script>
+/* Registered from the root scope so it can control "/" -- see the note in
+   app.py's /sw.js route. Failure is silent and harmless: the worker only ever
+   speeds up the shell, and the app works identically without one. */
+if ("serviceWorker" in navigator) {
+  window.addEventListener("load", () => {
+    navigator.serviceWorker.register("/sw.js", { scope: "/" }).catch(() => {});
+  });
+}
+</script>
+</body>
+</html>

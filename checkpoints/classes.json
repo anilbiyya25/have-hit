@@ -1,0 +1,33 @@
+{
+  "classes": [
+    "squats",
+    "push_ups",
+    "barbell_squat",
+    "bench_press",
+    "barbell_row",
+    "bicep_curl",
+    "shoulder_press",
+    "pull_ups",
+    "chin_ups",
+    "dips",
+    "diamond_pushups",
+    "deadlift",
+    "lunges",
+    "lat_pulldown",
+    "lat_raise",
+    "tricep_extension",
+    "plank",
+    "sit_ups",
+    "leg_raises",
+    "russian_twist",
+    "burpees",
+    "jumping_jacks",
+    "jump_rope",
+    "mountain_climbers",
+    "high_knees",
+    "kettlebell_swing",
+    "box_jumps"
+  ],
+  "num_classes": 27,
+  "val_accuracy": 0.4394
+}

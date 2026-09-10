@@ -1,0 +1,23 @@
+[13:55:23] waiting for 6.0 GB free RAM (timeout 30 min)
+[13:55:23] currently free: 3.7 GB
+[14:08:23] RAM available: 8.3 GB -- starting benchmark
+
+===== STDOUT =====
+variant        : vjepa2_1_vit_large_384
+gpu            : NVIDIA GeForce RTX 3050 Laptop GPU  (4096 MB)
+loaded in      : 16.0s
+
+==============================================
+params         : 304.7M
+tokens/clip    : 4608
+embed dim      : 1024
+weights        : 1162 MB
+peak reserved  : 2118 MB  (of 4096 MB)
+latency median : 771 ms
+latency min/max: 765 / 777 ms
+fits in 4GB    : yes
+==============================================
+
+
+exit code: 0
+[14:08:58] done, exit 0
