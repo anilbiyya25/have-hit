@@ -1,5 +1,9 @@
 # Have Hit
 
+> **🧠 Powered by [V-JEPA 2.1](https://github.com/facebookresearch/vjepa2) — Meta's World Model for Video Understanding**
+
+An AI-powered fitness coaching platform that uses **V-JEPA (Video Joint Embedding Predictive Architecture)**, Meta's state-of-the-art world model, to understand and classify human exercises from video in real time. V-JEPA learns rich spatiotemporal representations of the physical world without relying on text or labeled data — making it ideal for understanding human motion and form.
+
 Point a camera at someone and identify what exercise they're doing.
 Phase 1: 7 exercises, mobile-first.
 
